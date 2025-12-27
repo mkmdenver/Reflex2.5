@@ -57,3 +57,9 @@ cockpit/*view/**/build/
 cockpit/*view/**/.next/
 cockpit/*view/**/.vite/
 cockpit/*view/**/coverage/
+
+# Local env files
+.env
+.env.local
+.env.*
+.env.local
