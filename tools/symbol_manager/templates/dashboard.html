@@ -1,0 +1,25 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Dashboard</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <h1>Dashboard</h1>
+  <ul>
+    <li>Ticks: {{ stats['ticks'] }}</li>
+    <li>Quotes: {{ stats['quotes'] }}</li>
+    <li>1m Bars: {{ stats['bars_1m'] }}</li>
+    <li>1d Bars: {{ stats['bars_1d'] }}</li>
+  </ul>
+  <h3>KPI last hour</h3>
+  <table border="1" cellpadding="6" cellspacing="0">
+    <tr><th>Dataset</th><th>Rows</th></tr>
+    {% for dataset, rows in stats['kpi_1h'] %}
+    <tr><td>{{ dataset }}</td><td>{{ rows }}</td></tr>
+    {% endfor %}
+  </table>
+  <p><a href="{{ url_for('index') }}">Back to menu</a></p>
+</body>
+</html>

@@ -1,0 +1,59 @@
+<!--
+=============================================================================
+templates/base.html
+Version: 2025.10.22-rc1
+
+CHANGELOG
+- 2025-10-22: rc1
+  • Added menu link "Backfill Ticks → Parquet".
+  • Injected modal container used by popup console.
+=============================================================================
+-->
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Reflex - Database Manager</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <nav>
+      <ul>
+        <li><a href="{{ url_for('init_db_form') }}">Initialize DB</a></li>
+        <li><a href="{{ url_for('symbol_editor_form') }}">Symbol Editor</a></li>
+        <li><a href="{{ url_for('finviz_prime_form') }}">Import Fundamentals (Finviz)</a></li>
+        <li><a href="{{ url_for('backfill_polygon_form') }}">Backfill (Polygon)</a></li>
+        <li><a href="{{ url_for('ticks_ui.ticks_form') }}">Backfill Ticks → Parquet</a></li>
+        <li><a href="{{ url_for('dashboard') }}">Dashboard</a></li>
+        <li><a href="{{ url_for('logs') }}">Service Metrics</a></li>
+      </ul>
+    </nav>
+    <div class="content">
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+          <ul class="flashes">
+            {% for category, message in messages %}
+              <li class="flash {{ category }}">{{ message }}</li>
+            {% endfor %}
+          </ul>
+        {% endif %}
+      {% endwith %}
+      {% block content %}{% endblock %}
+    </div>
+
+    <!-- Modal used by SSE popup console -->
+    <div id="modal" class="modal hide">
+      <div class="modal-card">
+        <div class="modal-header">
+          <div class="modal-title" id="modal-title">Job Console</div>
+          <button class="modal-close" onclick="Modal.close()">×</button>
+        </div>
+        <pre id="modal-body" class="modal-body"></pre>
+        <div class="modal-footer">
+          <button onclick="Modal.close()">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='ticks_modal.js') }}"></script>
+</body>
+</html>

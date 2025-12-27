@@ -1,0 +1,70 @@
+<!--
+=============================================================================
+templates/ticks_backfill.html
+Version: 2025.10.22-rc1
+
+CHANGELOG
+- 2025-10-22: rc1
+  • Compact form for full-universe/candidates ticks backfill.
+  • Starts job via AJAX; opens popup modal with streaming console (SSE).
+=============================================================================
+-->
+{% extends "base.html" %}
+{% block content %}
+<h1>⚡ Backfill Ticks → Parquet</h1>
+
+<form id="ticks-form" class="form" onsubmit="return startJob(event)">
+  <div class="grid">
+    <label>Start
+      <input type="date" name="start" value="2021-01-01" required>
+    </label>
+    <label>End
+      <input type="text" name="end" value="today" placeholder="YYYY-MM-DD or 'today'">
+    </label>
+    <label>Mode
+      <select name="mode">
+        <option value="candidates">candidates (recommended)</option>
+        <option value="all">all symbols</option>
+      </select>
+    </label>
+    <label>Workers
+      <input type="number" name="workers" min="1" max="24" value="6">
+    </label>
+    <label class="chk"><input type="checkbox" name="force"> overwrite files</label>
+    <label class="chk"><input type="checkbox" name="lineage"> write lineage</label>
+  </div>
+  <div class="actions">
+    <button type="submit">Start Backfill</button>
+  </div>
+</form>
+
+<script>
+async function startJob(ev){
+  ev.preventDefault();
+  const form = document.getElementById("ticks-form");
+  const fd = new FormData(form);
+  const resp = await fetch("{{ url_for('ticks_ui.ticks_start') }}", {
+    method: "POST",
+    body: fd
+  });
+  if(!resp.ok){
+    alert("Failed to start job");
+    return false;
+  }
+  const data = await resp.json();
+  const jobId = data.job_id;
+  Modal.open("Ticks Backfill Console", "Starting...\n");
+  const evs = new EventSource(`/events/backfill/${jobId}`);
+  evs.onmessage = (e) => {
+    const line = e.data || "";
+    if(line === "[CLOSE]"){ evs.close(); }
+    Modal.append(line + "\n");
+  };
+  evs.onerror = (e) => {
+    Modal.append("[ERROR] event stream closed\n");
+    evs.close();
+  };
+  return false;
+}
+</script>
+{% endblock %}

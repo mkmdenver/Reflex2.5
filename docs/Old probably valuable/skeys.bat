@@ -1,0 +1,2 @@
+setx POLYGON_API_KEY "QiJFJRvmCaea9OGVfp6n2IyYpnHF3qFN"
+setx POLYGON_ENABLE_WS "true"

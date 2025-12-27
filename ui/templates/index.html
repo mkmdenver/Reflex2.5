@@ -1,0 +1,44 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Reflex Cockpit</title>
+    <link rel="stylesheet" href="/static/app.css">
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>Reflex Cockpit</h1>
+
+      <section class="gauges">
+        <div class="gauge-card"><h3>WS Last Msg</h3><div class="gauge" id="g_ws_last"></div><div class="value" id="v_ws_last">--</div></div>
+        <div class="gauge-card"><h3>Inbound Q</h3><div class="gauge" id="g_in_q"></div><div class="value" id="v_in_q">--</div></div>
+        <div class="gauge-card"><h3>Outbound Q</h3><div class="gauge" id="g_out_q"></div><div class="value" id="v_out_q">--</div></div>
+        <div class="gauge-card"><h3>DB Last Write</h3><div class="gauge" id="g_db_last"></div><div class="value" id="v_db_last">--</div></div>
+        <div class="gauge-card"><h3>Evaluator PnL</h3><div class="gauge" id="g_pnl"></div><div class="value" id="v_pnl">--</div></div>
+        <div class="gauge-card"><h3>Drawdown %</h3><div class="gauge" id="g_dd"></div><div class="value" id="v_dd">--</div></div>
+      </section>
+
+      <section class="controls">
+        <h2>Evaluator Controls</h2>
+        <div class="control-row"><label>Throttle (shares)</label><input type="number" id="ctl_throttle" value="100"></div>
+        <div class="control-row"><label>Torque (DD multiplier)</label><input type="number" id="ctl_torque" step="0.1" value="1.0"></div>
+        <div class="control-row"><label>Gear (1-5)</label><input type="number" id="ctl_gear" min="1" max="5" value="1"></div>
+        <div class="control-row"><label>Mix</label><input type="text" id="ctl_mix" value="default"></div>
+        <div class="control-row"><label>Paused</label><input type="checkbox" id="ctl_paused"></div>
+        <button id="btn_apply">Apply</button>
+      </section>
+
+      <section class="tiers">
+        <h2>Engineer’s Panel — Tiers</h2>
+        <div id="tiers_table"></div>
+      </section>
+
+      <section class="kpi">
+        <h2>Ingest KPI (rows/min)</h2>
+        <div id="kpi_box"></div>
+      </section>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

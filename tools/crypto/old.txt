@@ -1,0 +1,19 @@
+
+
+$env:REFLEX__FERNET_KEY = "3sN50nl3ODV_78_34J_od9WPm_BJaM-4daeQvdEYqpo="
+# api_key_id
+python .\tools\crypto\fernet_util.py encrypt --text "AK3GQWJTSQWLEVUN72L4CRHKWH"
+# → note the "sql_value" field from the JSON
+
+# api_secret
+python .\tools\crypto\fernet_util.py encrypt --text "586HoLTHaQLNCbyPjjS4WM1wER7D5GsUbiSBcT8Xekw6"
+# → note the "sql_value" again
+
+# api_key_id
+python .\tools\crypto\fernet_util.py encrypt --text "PKRHSACK66QJDQPUPSP2CNABLJ"
+# → note the "sql_value" field from the JSON
+
+# api_secret
+python .\tools\crypto\fernet_util.py encrypt --text "FbNCB8ULy5ECySvD9sNJFi7oLtb2SMQniAvQZHzySde7"
+# → note the "sql_value" again
+

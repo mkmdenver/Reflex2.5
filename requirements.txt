@@ -1,0 +1,73 @@
+# ========================
+# Core web/API
+# ========================
+fastapi>=0.115
+uvicorn>=0.30          # don't use [standard] on Windows
+# ========================
+# Realtime + Messaging
+# ========================
+websocket-client>=1.8  # used by your Polygon WS code
+websockets>=12.0       # optional async WS (kept for flexibility)
+redis>=5.0             # Garnet/Redis protocol client
+# ========================
+# Database (Postgres/Timescale)
+# ========================
+psycopg[binary]>=3.2   # psycopg3 binary wheels (good on Windows)
+# ========================
+# Data / ETL / Calendars
+# ========================
+pandas>=2.2
+pandas-market-calendars>=4.4   # import as pandas_market_calendars
+numpy>=1.26                    # explicit to avoid old wheel resolution on Win
+tzdata>=2024.1                 # Windows time zone database for pandas/py3.9+
+# ========================
+# HTTP clients & utilities
+# ========================
+requests>=2.32               # your Polygon REST wrapper uses this
+httpx>=0.27                  # optional async client (nice for future)
+python-dotenv>=1.0
+PyYAML>=6.0.1
+tenacity>=8.2                # polite retries (safe, tiny)
+rich>=13.7                   # prettier CLI logs (optional but handy)
+tqdm>=4.66                   # progress bars (S3 bulk downloader etc.)
+# ========================
+# Market data helpers
+# ========================
+finvizfinance>=0.14.5        # used by finviz_fetch.py
+# ========================
+# Cloud / Storage (S3 bulk)
+# ========================
+boto3>=1.34
+# ========================
+# Metrics
+# ========================
+prometheus-client>=0.20
+# ========================
+# JSON speedups (optional but safe on Windows)
+# ========================
+orjson>=3.10
+# ========================
+# Flask stack (DbManager, Cockpit)
+# ========================
+Flask>=3.0,<4.0
+flask-cors>=4.0          # CORS for browser UIs hitting your APIs
+waitress>=2.1            # production WSGI server on Windows (instead of gunicorn)
+prometheus-fastapi-instrumentator==6.1.0  # Prometheus for Flask/WSGI
+# ========================
+# Additional dependencies
+# ========================
+pyarrow
+redis>=5.0.1
+msgpack>=1.0.7
+# --- Async adapter + interprocess additions ---
+aiohttp>=3.10
+# Optional: low-level I/O and diagnostics used in adapters
+async-timeout>=4.0
+yarl>=1.9
+multidict>=6.0
+psycopg[binary]>=3.2.0
+
+fastapi >= 0.110
+pydantic >= 2.6
+typing-extensions >= 4.8
+cryptography>=42

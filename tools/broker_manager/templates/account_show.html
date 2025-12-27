@@ -1,0 +1,1 @@
+{% extends 'base.html' %}{% block content %}<h2>Account {{a.account_id}}</h2><p><a href='/creds/new?scope_type=account&scope_id={{a.account_id}}'>+Cred</a> | <a href='/flags/new?account_id={{a.account_id}}'>+Flag</a></p>{% endblock %}

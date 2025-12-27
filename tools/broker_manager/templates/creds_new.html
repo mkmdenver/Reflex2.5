@@ -1,0 +1,1 @@
+{% extends 'base.html' %}{% block content %}<h2>New Credential</h2><form method='post' action='/creds/create'><input type='hidden' name='scope_type' value='{{scope_type}}'/><input type='hidden' name='scope_id' value='{{scope_id}}'/><input name='key' placeholder='api_key' required/><br/><input name='value' required/><br/><button>Save</button></form>{% endblock %}

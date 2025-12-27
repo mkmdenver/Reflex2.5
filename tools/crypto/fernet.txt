@@ -1,0 +1,13 @@
+# In repo root
+$k = $env:REFLEX_FERNET_KEY  # from your .env (already set)
+# Paper creds -> returns 3 lines (api_key, api_secret, base_url)
+python tools\crypto\fernet_util.py $k `
+  'PKEPLOKISRV3JVNIYNVKEXIS7A' `
+  '2swmi1b6qf6ey4oJgNZtBjof22THWHZkzoPzscAcuhgi' `
+  'https://paper-api.alpaca.markets'
+
+# Live creds
+python tools\crypto\fernet_util.py $k `
+  'AKX3IXLZG2YR7VPGCPBDEI2EPR' `
+  'AGSKRLPicPVvDr5uLaXr5JeFeGtvcmzutdsXxiPjKpAw' `
+  'https://api.alpaca.markets'

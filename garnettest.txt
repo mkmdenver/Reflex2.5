@@ -1,0 +1,5 @@
+# Should show TcpTestSucceeded : True
+Test-NetConnection 127.0.0.1 -Port 6379
+
+# Or see the listener/PID
+netstat -ano | findstr :6379

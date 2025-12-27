@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}Eval {{ eval_id }}{% endblock %}
+{% block content %}
+<h2>Evaluator {{ eval_id }}</h2>
+<table class="grid">
+  <thead>
+    <tr>
+      <th>Module</th>
+      <th>Symbol</th>
+      <th>Phase</th>
+      <th>Validity</th>
+      <th>Risk</th>
+      <th>Edge</th>
+      <th>Age (s)</th>
+      <th>Host</th>
+      <th>Note</th>
+      <th>Metrics</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for sv in rows %}
+    <tr class="{% if sv.is_stale %}stale{% elif sv.edge > 2.0 %}hot{% endif %}">
+      <td>{{ sv.module }}</td>
+      <td>{{ sv.symbol or "•" }}</td>
+      <td>{{ sv.phase }}</td>
+      <td>{{ "%.2f"|format(sv.validity) }}</td>
+      <td>{{ "%.2f"|format(sv.risk) }}</td>
+      <td>{{ "%.2f"|format(sv.edge) }}</td>
+      <td>{{ "%.1f"|format(sv.age_sec) }}</td>
+      <td>{{ sv.host }}</td>
+      <td>{{ sv.note or "" }}</td>
+      <td><code>{{ sv.metrics }}</code></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

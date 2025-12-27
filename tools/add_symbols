@@ -1,0 +1,6 @@
+c:\Projects\Reflex2.3\tools>add_symbols --symbol SPY --db-tier 0 --rt-tier 0 --filter universe_index
+[PATH] ROOT = c:\Projects\Reflex2.3
+[ENV] Loading "c:\Projects\Reflex2.3\.env" ...
+[RUN] c:\Projects\Reflex2.3\tools\.venv\Scripts\python.exe "c:\Projects\Reflex2.3\tools\add_symbols.py" --symbol SPY --db-tier 0 --rt-tier 0 --filter universe_index
+[OK] SPY fundamentals updated: sector=open in yahoo float=None mcap=None
+[COMMIT] 1/1

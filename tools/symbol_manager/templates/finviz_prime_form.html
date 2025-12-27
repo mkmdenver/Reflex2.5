@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Finviz Prime (Live Fetch)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 2rem; }
+    .card { max-width: 860px; border: 1px solid #ddd; border-radius: 12px; padding: 1.5rem; }
+    .row { margin: 1rem 0; }
+    label { margin-right: 1rem; }
+    textarea { width: 100%; min-height: 6rem; }
+    select, input[type="text"], input[type="number"] { min-width: 280px; padding: .4rem; }
+    button { padding: .6rem 1rem; border-radius: 8px; border: 1px solid #888; cursor: pointer; }
+    .hint { color: #555; font-size: .9rem; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Finviz Prime (Live Fetch)</h1>
+    <p class="hint">Fetch symbols & fundamentals live from Finviz, hydrate the DB, then enrich every symbol via Polygon to populate <code>list_date</code>.</p>
+
+    <form action="{{ url_for('finviz_prime_form') }}" method="post">
+      <div class="row">
+        <strong>Exchanges:</strong><br>
+        <label><input type="checkbox" name="exchanges" value="NASDAQ" {% if 'NASDAQ' in exchanges %}checked{% endif %}> NASDAQ</label>
+        <label><input type="checkbox" name="exchanges" value="NYSE" {% if 'NYSE' in exchanges %}checked{% endif %}> NYSE</label>
+        <label><input type="checkbox" name="exchanges" value="AMEX" {% if 'AMEX' in exchanges %}checked{% endif %}> AMEX</label>
+      </div>
+
+      <div class="row">
+        <label>Market Cap:
+          <select name="market_cap">
+            <option {% if market_cap == "Small ($300mln to $2bln)" %}selected{% endif %}>Small ($300mln to $2bln)</option>
+            <option {% if market_cap == "Mid ($2bln to $10bln)" %}selected{% endif %}>Mid ($2bln to $10bln)</option>
+            <option {% if market_cap == "Large ($10bln to $200bln)" %}selected{% endif %}>Large ($10bln to $200bln)</option>
+            <option {% if market_cap == "Mega ($200bln and more)" %}selected{% endif %}>Mega ($200bln and more)</option>
+            <option {% if market_cap == "Micro ($50mln to $300mln)" %}selected{% endif %}>Micro ($50mln to $300mln)</option>
+            <option {% if market_cap == "Nano (under $50mln)" %}selected{% endif %}>Nano (under $50mln)</option>
+            <option {% if market_cap == "Any" %}selected{% endif %}>Any</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="row">
+        <label>Price:
+          <select name="price">
+            <option {% if price == "Over $1" %}selected{% endif %}>Over $1</option>
+            <option {% if price == "Over $5" %}selected{% endif %}>Over $5</option>
+            <option {% if price == "Under $10" %}selected{% endif %}>Under $10</option>
+            <option {% if price == "Any" %}selected{% endif %}>Any</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="row">
+        <label>Join How:
+          <select name="join_how">
+            <option value="outer" {% if join_how == "outer" %}selected{% endif %}>outer (union of Overview + Ownership)</option>
+            <option value="inner" {% if join_how == "inner" %}selected{% endif %}>inner (intersection)</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="row">
+        <label>Sleep between Finviz calls (sec):
+          <input type="number" min="0" step="0.05" name="sleep_between_calls_s" value="0.25">
+        </label>
+      </div>
+
+      <div class="row">
+        <label>Extra Finviz filters (optional):</label>
+        <textarea name="extra_filters" placeholder="One key:value per line, e.g.
+P/E: Under 20
+Dividend Yield: Over 2%"></textarea>
+        <div class="hint">These map directly to finvizfinance filters (they must match Finviz filter names).</div>
+      </div>
+
+      <div class="row">
+        <button type="submit">Run Live Fetch → Load → Enrich</button>
+        <a href="{{ url_for('index') }}" style="margin-left: .75rem;">← Back</a>
+      </div>
+    </form>
+  </div>
+</body>
+</html>

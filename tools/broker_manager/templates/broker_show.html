@@ -1,0 +1,1 @@
+{% extends 'base.html' %}{% block content %}<h2>Broker {{b.broker_id}}</h2><p>{{b.display_name}}</p><p><a href='/creds/new?scope_type=broker&scope_id={{b.broker_id}}'>+Cred</a></p><ul>{% for a in accounts %}<li><a href='/accounts/{{a.account_id}}'>{{a.account_id}}</a></li>{% endfor %}</ul>{% endblock %}

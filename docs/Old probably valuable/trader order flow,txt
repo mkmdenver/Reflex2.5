@@ -1,0 +1,252 @@
+1) Order State Machine — crisp, auditable, idempotent
+Core ideas
+
+One row per order in public.trader_orders. Mutate status + append events.
+
+Immutable event log in public.trader_order_events for forensics.
+
+Idempotency keys so retries don’t duplicate.
+
+Separation of concerns:
+
+Consumer (reads intents, validates, writes ACK).
+
+OrderManager (risk check → route → update status).
+
+BrokerAdapter (sim/alpaca/ib… returns external IDs, fills, rejects).
+
+States (minimal but expressive)
+
+ACK – intent accepted by Trader (parsed + persisted).
+
+REJECTED – failed risk / validation (final).
+
+ROUTING – being sent to a broker (transient).
+
+PENDING – accepted by broker, waiting fill/cancel.
+
+PARTIAL – partially filled.
+
+FILLED – fully filled (final).
+
+CANCELED – canceled by us or broker (final).
+
+ERROR – operational failure (retryable depending on error).
+
+Transitions (happy path)
+
+ACK → ROUTING → PENDING → (PARTIAL)* → FILLED
+
+Transitions (sad paths)
+
+ACK → REJECTED (risk says nope)
+
+ROUTING → ERROR (adapter down / 5xx) → backoff → retry → ROUTING/PENDING
+
+PENDING → CANCELED (cancel request or broker cancel)
+
+PENDING/PARTIAL → ERROR (dropout) → recover to PENDING via broker poll
+
+Tables (lean + durable)
+
+public.trader_orders (you already have the core)
+
+id bigserial pk
+
+instance_id text (e.g., liveA)
+
+intent_id text unique (ULID/UUID from evaluator to ensure idempotency)
+
+symbol text, side text, qty int, price numeric(18,6)
+
+status text not null
+
+broker text null (e.g., sim, alpaca)
+
+broker_order_id text null
+
+error text null
+
+payload jsonb null (original intent + enrichments)
+
+created_at timestamptz default now()
+
+updated_at timestamptz default now()
+
+public.trader_order_events
+
+id bigserial pk
+
+order_id bigint references trader_orders(id)
+
+ts timestamptz default now()
+
+event text (ACK, ROUTING, SENT, PENDING, PARTIAL, FILL, CANCEL, ERROR)
+
+details jsonb (adapter response, fill qty/price, error, etc.)
+
+On every status change: update trader_orders.status, bump updated_at, and insert a row into trader_order_events.
+
+Idempotency & retries
+
+Evaluator includes intent_id in the message. Trader does:
+
+if intent_id exists → no new row; optionally re-emit same status.
+
+Routing retries: exponential backoff with jitter, cap attempts, then ERROR with reason but keep polling broker by broker_order_id if known.
+
+Poison handling: if parsing fails → REJECTED with error = 'parse'.
+
+Concurrency control
+
+Single writer per order_id. Use UPDATE … WHERE id = $1 AND status = $expected to avoid stomps, or SELECT … FOR UPDATE SKIP LOCKED in a work queue.
+
+Broker callbacks (webhooks/polls) funnel through OrderManager.apply_event(order_id, evt) to keep transitions legal.
+
+Minimal wire format (what Evaluator enqueues)
+{
+  "intent_id": "01JBC…ULID",     // required
+  "symbol": "AAPL",
+  "side": "buy",                 // buy|sell
+  "qty": 300,
+  "price": 189.03,               // limit; omit for MKT in future
+  "time_in_force": "day",
+  "broker": "sim"                // or "alpaca"
+}
+
+2) Risk Feedback Loop — live governor + backpressure
+
+Think three concentric rings: pre-admission, in-flight caps, circuit breakers. Your public.trader_risk is a good seed; let’s widen it just enough to be useful without becoming a compliance department.
+
+Configuration (DB row per instance)
+
+Extend public.trader_risk:
+
+instance_id text pk
+
+flow control
+
+orders_max integer (max in-flight orders across all symbols)
+
+stream_maxlen integer (Redis list cap — you have this)
+
+exposure
+
+notional_max numeric(18,2) (sum of |qty*price| for open orders + positions)
+
+per_symbol_qty_max int
+
+per_symbol_notional_max numeric(18,2)
+
+guardrails
+
+trading_enabled boolean default true (big red switch)
+
+cooldown_seconds int default 0 (enter cooldown after breach)
+
+breach_count int default 0 (telemetry)
+
+updated_at timestamptz
+
+You can keep half of these null until you need them; checks only run on non-null settings.
+
+Live metrics the risk code needs
+
+In-flight count: SELECT count(*) FROM trader_orders WHERE status IN ('ROUTING','PENDING','PARTIAL') AND instance_id=$1;
+
+Per-symbol aggregates pending + positions (positions table is future work; for now, sum pending order qty/notional by symbol).
+
+Notional exposure: sum(|qty * price|) for in-flight + positions.
+
+Flow
+
+Consumer ACKs the intent (so you don’t lose it).
+
+Risk gate runs before ROUTING. If any rule trips:
+
+update order to REJECTED with error='risk:<reason>'
+
+do not enqueue to broker adapter.
+
+Backpressure:
+
+If orders_max reached, don’t reject. Put order in QUEUED (optional transitional state) or leave at ACK and a sweeper promotes them FIFO when capacity frees.
+
+Circuit breaker:
+
+If trading_enabled=false or cooldown active → reject new intents immediately (REJECTED with error='circuit').
+
+Risk process can flip trading_enabled=false on repeated breaches or too many ERROR/REJECTED per minute.
+
+Feedback to Evaluator:
+
+Publish a light risk status heartbeat to Redis pubsub reflex:risk.status every N seconds:
+
+{ "instance":"liveA",
+  "in_flight": 12,
+  "orders_max": 20,
+  "exposure": 480000.00,
+  "notional_max": 750000.00,
+  "trading_enabled": true,
+  "cooldown_remaining": 0 }
+
+
+Evaluator can throttle upstream generation if in_flight is near cap (soft backpressure).
+
+Simple SQL snippets
+
+In-flight cap check
+
+SELECT count(*) AS in_flight
+FROM public.trader_orders
+WHERE instance_id = $1
+  AND status IN ('ROUTING','PENDING','PARTIAL');
+
+
+Symbol cap check
+
+SELECT coalesce(sum(qty),0) AS qty_sum,
+       coalesce(sum(qty*price),0) AS notion
+FROM public.trader_orders
+WHERE instance_id = $1
+  AND symbol = $2
+  AND status IN ('ROUTING','PENDING','PARTIAL');
+
+
+Enable hard stop
+
+UPDATE public.trader_risk
+SET trading_enabled = false, updated_at = now()
+WHERE instance_id = 'liveA';
+
+Minimal Python shape (pseudocode, short)
+# order_manager.py
+def admit_intent(intent, risk, db):
+    order = upsert_ack(intent, db)            # ACK row (idempotent by intent_id)
+    if not risk.trading_enabled:
+        return reject(order, "circuit")
+    if over_in_flight_cap(db, risk):
+        return keep_ack(order)                # optional QUEUED
+    if over_symbol_cap(db, risk, intent.symbol, intent.qty, intent.price):
+        return reject(order, "symbol_cap")
+    if over_notional(db, risk, intent.qty, intent.price):
+        return reject(order, "notional")
+
+    update_status(order, "ROUTING")
+    try:
+        broker_id = adapter.send(order)
+        set_pending(order, broker_id)
+    except TemporaryError as e:
+        update_status(order, "ERROR", error=str(e))
+        schedule_retry(order)
+    except FatalError as e:
+        update_status(order, "REJECTED", error=str(e))
+    return order
+
+Why this split works
+
+You get determinism (single source of truth in DB) and observability (event rows) without over-engineering.
+
+Risk stays data-driven (DB row hot-reloaded by your running risk_sync) and can evolve independently from order routing.
+
+Backpressure is explicit, so Evaluator can be clever instead of blind-firing.

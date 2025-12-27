@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block title %}Eval not found{% endblock %}
+{% block content %}
+<h2>Evaluator "{{ eval_id }}" not found</h2>
+<p>No telemetry has been seen yet for that eval_id. Check that the evaluator
+is running and emitting EvalState on <code>{{ EVAL_STATE_CHANNEL }}</code>.</p>
+{% endblock %}

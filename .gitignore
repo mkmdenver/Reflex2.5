@@ -1,0 +1,59 @@
+# --- Python junk ---
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# --- Virtualenvs ---
+.venv/
+venv/
+ENV/
+env/
+
+# --- Logs / runtime output ---
+logs/
+*.log
+*.out
+
+# --- Node / frontend ---
+node_modules/
+dist/
+build/
+.next/
+.vite/
+coverage/
+
+# --- OS/editor ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- Your "templates" folder should not accumulate runtime junk ---
+**/templates/**/__pycache__/
+**/templates/**/*.pyc
+**/templates/**/*.pyo
+**/templates/**/*.log
+**/templates/**/logs/
+
+# Ignore runtime/build junk under cockpit views
+cockpit/*view/**/__pycache__/
+cockpit/*view/**/*.pyc
+cockpit/*view/**/*.pyo
+cockpit/*view/**/*.log
+cockpit/*view/**/logs/
+cockpit/*view/**/.cache/
+cockpit/*view/**/.pytest_cache/
+cockpit/*view/**/.mypy_cache/
+cockpit/*view/**/.ruff_cache/
+
+# If any views have frontend build outputs
+cockpit/*view/**/node_modules/
+cockpit/*view/**/dist/
+cockpit/*view/**/build/
+cockpit/*view/**/.next/
+cockpit/*view/**/.vite/
+cockpit/*view/**/coverage/

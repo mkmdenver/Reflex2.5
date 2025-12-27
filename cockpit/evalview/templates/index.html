@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Eval Instances{% endblock %}
+{% block content %}
+<h2>Evaluator Instances</h2>
+<table class="grid">
+  <thead>
+    <tr>
+      <th>Eval ID</th>
+      <th>Modules</th>
+      <th>Rows</th>
+      <th>Last Update (age)</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for e in evals %}
+    <tr>
+      <td><a href="{{ url_for('eval_view', eval_id=e.eval_id) }}">{{ e.eval_id }}</a></td>
+      <td>{{ ", ".join(e.modules) }}</td>
+      <td>{{ e.rows }}</td>
+      <td>
+        {% if e.age_sec is not none %}
+          {{ "%.1f"|format(e.age_sec) }}s ago
+        {% else %}
+          n/a
+        {% endif %}
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

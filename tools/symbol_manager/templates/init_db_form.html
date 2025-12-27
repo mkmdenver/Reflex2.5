@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Initialize Database - Reflex - Database Manager{% endblock %}
+{% block content %}
+<h1>Initialize the Database</h1>
+
+<div class="card danger">
+  <p><strong>Warning:</strong> This will reset the database state. Type <code>DELETE</code> to confirm.</p>
+</div>
+
+<form method="post" class="form">
+  <label for="confirm_text">Confirmation</label>
+  <input id="confirm_text" name="confirm_text" type="text" placeholder="Type DELETE to confirm" required>
+
+  <button type="submit" class="btn danger">Initialize</button>
+</form>
+
+<p class="help">Simulates initialization and resets in-memory state.</p>
+{% endblock %}

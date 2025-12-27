@@ -1,0 +1,66 @@
+Pause / resume mid-alphabet
+
+Kill with Ctrl+C, then resume from a ticker:
+
+$env:START_AT = "CLTP"
+.\.venv\Scripts\python.exe -m dbmanager.db_backfill --mode last2 --symbol ALL
+
+Quick SQL spot-checks (pgAdmin / psql)
+
+Replace the dates if you’re running this on another day.
+
+Daily bars written (last 2 days):
+
+SELECT date, COUNT(*) AS rows_written
+FROM daily_bars
+WHERE date BETWEEN DATE '2025-10-28' AND DATE '2025-10-29'
+GROUP BY date
+ORDER BY date;
+
+
+Minute bars written (per day):
+
+SELECT time::date AS day, COUNT(*) AS rows_written
+FROM minute_bars
+WHERE time >= TIMESTAMP '2025-10-28 00:00:00'
+  AND time <  TIMESTAMP '2025-10-30 00:00:00'
+GROUP BY day
+ORDER BY day;
+
+
+Per-symbol sanity (top 10, yesterday):
+
+SELECT symbol, COUNT(*) AS min_rows
+FROM minute_bars
+WHERE time >= TIMESTAMP '2025-10-29 00:00:00'
+  AND time <  TIMESTAMP '2025-10-30 00:00:00'
+GROUP BY symbol
+ORDER BY min_rows DESC
+LIMIT 10;
+
+
+Missing-minute detector (symbols with zero minutes on 2025-10-29):
+
+WITH have_minutes AS (
+  SELECT DISTINCT symbol
+  FROM minute_bars
+  WHERE time >= TIMESTAMP '2025-10-29 00:00:00'
+    AND time <  TIMESTAMP '2025-10-30 00:00:00'
+)
+SELECT sm.symbol
+FROM symbol_metadata sm
+LEFT JOIN have_minutes m USING (symbol)
+WHERE m.symbol IS NULL
+ORDER BY sm.symbol
+LIMIT 200;
+
+Tuning while it runs
+
+If Polygon gets grumpy, slow your driver knobs (whatever your backfill uses): lower concurrency or add a small sleep (50–150 ms) between requests.
+
+Want a narrower blast radius for testing? Run a subset:
+
+.\.venv\Scripts\python.exe -m dbmanager.db_backfill --mode last2 --symbol AAPL
+
+
+Need both minute+daily and ticks for those same two days? I can drop a one-liner wrapper that chains your tick fetcher for the identical window.

@@ -1,0 +1,2 @@
+robocopy "C:\Program Files\PostgreSQL\17\data\pg_wal" "W:\pg_wal" /MIR /SEC /R:1 /W:1
+

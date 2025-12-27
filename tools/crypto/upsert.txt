@@ -1,0 +1,102 @@
+-- =====================================================================
+-- Seed/Upsert Alpaca + URLs into credentials (plain SQL, pgAdmin-friendly)
+-- Expecting Fernet *ciphertext* (base64) for api_key, api_secret, base_url
+-- =====================================================================
+
+BEGIN;
+
+-- Create table if it doesn't exist (safe no-op if already created)
+CREATE TABLE IF NOT EXISTS public.credentials (
+  scope_type   text    NOT NULL,     -- e.g., 'account' or 'broker'
+  scope_id     text    NOT NULL,     -- e.g., 'alpaca:paper'
+  key          text    NOT NULL,     -- e.g., 'api_key' | 'api_secret' | 'base_url'
+  value_cipher bytea   NOT NULL,     -- Fernet ciphertext as bytea (from base64)
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT pk_credentials PRIMARY KEY(scope_type, scope_id, key)
+);
+
+-- Keep updated_at fresh on change
+CREATE OR REPLACE FUNCTION public.t_credentials_touch_updated_at()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  NEW.updated_at := now();
+  RETURN NEW;
+END
+$$;
+
+DROP TRIGGER IF EXISTS trg_credentials_touch ON public.credentials;
+CREATE TRIGGER trg_credentials_touch
+BEFORE UPDATE ON public.credentials
+FOR EACH ROW EXECUTE FUNCTION public.t_credentials_touch_updated_at();
+
+-- ==============================================
+-- REPLACE the placeholders below with your blobs
+-- ==============================================
+
+-- Alpaca PAPER
+INSERT INTO public.credentials(scope_type, scope_id, key, value_cipher)
+VALUES
+  ('account','alpaca:paper','api_key',    decode('Z0FBQUFBQnBFZmk1aGo2ZlcxdjZlUnE0YlZabFBrU0Z4WnJBOUlHMzl1N0tUcTd0S21MZ2taUF9DcU15aWZCbDNXY2hmLUxQTENaSk1MUzJOeXVtX0hiSFAwNERvVm9oaU5KRDJ4cHhfYV91UjdKUXRibTQzZ0U9','base64')),
+  ('account','alpaca:paper','api_secret', decode('Z0FBQUFBQnBFZmk1QndUUlQxTjRPano3cGVTU04xR0lGUkhobW8tSW53Z2t0Q2hvUnBjTW44WVFCLVJ2TkhjRzNtWG9vbUJJZWFEdU5Bbkc4dE9CcmJkLTJVSzZzOGdaRzc5ZmY2cklPSEthdWtZM1VMWDcxY1Z6bzVOS1hLb09Rc3FJaE85bV9OUlo=','base64')),
+  ('account','alpaca:paper','base_url',   decode('Z0FBQUFBQnBFZmk1dktwU3FyNmt3ay1NakVZVE5fX1VkSkI0ZEhZWVNtZzZDclQ2VFhZWVd0TWhYWWpDaFpCb1RLcVFxWl9DZWJCSGpJRE9MUy16WHVGb2pUUTJ4M1hiM3M0Y2JRX1kxa3FNOVd5cjhUc3Q3SVlNd2p2TjRpS3dvcFBGQXlBTnJ5WVI=','base64'))
+ON CONFLICT (scope_type, scope_id, key)
+DO UPDATE SET value_cipher = EXCLUDED.value_cipher;
+
+-- Alpaca LIVE
+INSERT INTO public.credentials(scope_type, scope_id, key, value_cipher)
+VALUES
+  ('account','alpaca:live','api_key',     decode('Z0FBQUFBQnBFZmk1Ml9OQzhkLXpDT1FRN29BTWdmYndzRWw2VFlCNjd5Rms0WVVWbW5yRXlhMnZwR1BkbXIyR3N0cGpKdVpiNzJlWjR2TVZ3ZWRSNjk2UHlRNzFoY0lRWjktUmY3U2hUTHlFcEFNcUU0UnRDUG89','base64')),
+  ('account','alpaca:live','api_secret',  decode('Z0FBQUFBQnBFZmk1TWFvV1hudTF1NkRCbFc4aFU0V05BYTJvclJ1T3ZEOVh1Ql9JLU1XaW9WM0VHNEJxQjhFLTBVVnAtYkR4WFdRTGFlTDhyd1BTcVkyVGZmcjFybnVKazk2QjRRQktMYW5lN1NIdEZlbzFJMTctMW5aa0Y3d1lMV1ZDSEJoVl9CTjY=','base64')),
+  ('account','alpaca:live','base_url',    decode('Z0FBQUFBQnBFZmk1RVZxSXJQakpOTGQxYUNWNjJ5ZWUtalZwSmJaOHJsdFFMYnhSbWdWZ1VRanBHeFduaWpfbkw3dC10Xy1PeHZONFFEM3VuRmtfWVJKelJsVVBTdXZVNV9Pd2hYdV9BaTd3UGRyMDZHWlpMR3M9'))
+ON CONFLICT (scope_type, scope_id, key)
+DO UPDATE SET value_cipher = EXCLUDED.value_cipher;
+
+COMMIT;
+
+-- ==================
+-- Quick sanity checks
+-- ==================
+
+-- 1) Confirm rows exist, and ciphertext isn't empty (byte length > 0)
+SELECT scope_type, scope_id, key,
+       octet_length(value_cipher) AS bytes,
+       to_char(updated_at,'YYYY-MM-DD HH24:MI:SS') AS updated_at
+FROM public.credentials
+WHERE scope_id IN ('alpaca:paper','alpaca:live')
+ORDER BY scope_id, key;
+
+-- 2) (Optional) If you want to wipe *only* Alpaca creds and re-run:
+-- BEGIN;
+-- DELETE FROM public.credentials
+-- WHERE scope_type='account' AND scope_id IN ('alpaca:paper','alpaca:live');
+-- COMMIT;
+
+
+
+
+-------------
+
+
+BEGIN;
+
+/* Alpaca PAPER */
+INSERT INTO public.credentials (scope_type, scope_id, key, value_cipher)
+VALUES
+  ('account','alpaca:paper','api_key',    decode('Z0FBQUFBQnBFZmk1aGo2ZlcxdjZlUnE0YlZabFBrU0Z4WnJBOUlHMzl1N0tUcTd0S21MZ2taUF9DcU15aWZCbDNXY2hmLUxQTENaSk1MUzJOeXVtX0hiSFAwNERvVm9oaU5KRDJ4cHhfYV91UjdKUXRibTQzZ0U9'::text, 'base64')),
+  ('account','alpaca:paper','api_secret', decode('Z0FBQUFBQnBFZmk1QndUUlQxTjRPano3cGVTU04xR0lGUkhobW8tSW53Z2t0Q2hvUnBjTW44WVFCLVJ2TkhjRzNtWG9vbUJJZWFEdU5Bbkc4dE9CcmJkLTJVSzZzOGdaRzc5ZmY2cklPSEthdWtZM1VMWDcxY1Z6bzVOS1hLb09Rc3FJaE85bV9OUlo='::text, 'base64')),
+  ('account','alpaca:paper','base_url',   decode('Z0FBQUFBQnBFZmk1dktwU3FyNmt3ay1NakVZVE5fX1VkSkI0ZEhZWVNtZzZDclQ2VFhZWVd0TWhYWWpDaFpCb1RLcVFxWl9DZWJCSGpJRE9MUy16WHVGb2pUUTJ4M1hiM3M0Y2JRX1kxa3FNOVd5cjhUc3Q3SVlNd2p2TjRpS3dvcFBGQXlBTnJ5WVI='::text, 'base64'))
+ON CONFLICT (scope_type, scope_id, key)
+DO UPDATE SET value_cipher = EXCLUDED.value_cipher;
+
+/* Alpaca LIVE */
+INSERT INTO public.credentials (scope_type, scope_id, key, value_cipher)
+VALUES
+  ('account','alpaca:live','api_key',     decode('Z0FBQUFBQnBFZmk1Ml9OQzhkLXpDT1FRN29BTWdmYndzRWw2VFlCNjd5Rms0WVVWbW5yRXlhMnZwR1BkbXIyR3N0cGpKdVpiNzJlWjR2TVZ3ZWRSNjk2UHlRNzFoY0lRWjktUmY3U2hUTHlFcEFNcUU0UnRDUG89'::text, 'base64')),
+  ('account','alpaca:live','api_secret',  decode('Z0FBQUFBQnBFZmk1TWFvV1hudTF1NkRCbFc4aFU0V05BYTJvclJ1T3ZEOVh1Ql9JLU1XaW9WM0VHNEJxQjhFLTBVVnAtYkR4WFdRTGFlTDhyd1BTcVkyVGZmcjFybnVKazk2QjRRQktMYW5lN1NIdEZlbzFJMTctMW5aa0Y3d1lMV1ZDSEJoVl9CTjY='::text, 'base64')),
+  ('account','alpaca:live','base_url',    decode('Z0FBQUFBQnBFZmk1RVZxSXJQakpOTGQxYUNWNjJ5ZWUtalZwSmJaOHJsdFFMYnhSbWdWZ1VRanBHeFduaWpfbkw3dC10Xy1PeHZONFFEM3VuRmtfWVJKelJsVVBTdXZVNV9Pd2hYdV9BaTd3UGRyMDZHWlpMR3M9'::text, 'base64'))
+ON CONFLICT (scope_type, scope_id, key)
+DO UPDATE SET value_cipher = EXCLUDED.value_cipher;
+
+COMMIT;
+

@@ -1,0 +1,93 @@
+Folder PATH listing for volume Windows
+Volume serial number is 442D-14D6
+C:.
+¦   app.py
+¦   bus.py
+¦   engine.py
+¦   evaluator_tree.txt
+¦   intent_tap.py
+¦   ipc_emit.py
+¦   loop.py
+¦   mcp_orchestrator.py
+¦   metrics_runtime.py
+¦   models.py
+¦   model_breakout.py
+¦   model_bullfag.py
+¦   model_combo_ross_bullflag.py
+¦   model_tiers.py
+¦   other combo_ross.py
+¦   other_simple_bars1.py
+¦   other_spy_momo.py
+¦   ross_supervisor.py
+¦   service.py
+¦   service_tiers.py
+¦   state.py
+¦   state_publisher.py
+¦   subscribe_quotes.py
+¦   __init__.py
+¦   
++---bots
+¦   ¦   CTI_rbf
+¦   ¦   CTI_simple1.py
+¦   ¦   cti_simple_bot.bat
+¦   ¦   debug_ross_filter_tap.py
+¦   ¦   FTS_rbf.py
+¦   ¦   fts_rbf_bot.bat
+¦   ¦   FTS_simple1.py
+¦   ¦   fts_simple_bot.bat
+¦   ¦   intent_tap.bat
+¦   ¦   intent_tap.py
+¦   ¦   PSI_simple1.py
+¦   ¦   PTI_rbf.py
+¦   ¦   pti_rbf_bot.bat
+¦   ¦   pti_simple_bot.bat
+¦   ¦   rbf_filter_tap.bat
+¦   ¦   reflex_rbf_pipeline.md
+¦   ¦   __init__.py
+¦   ¦   
+¦   +---abots
+¦   ¦       eval_shape_range.bat
+¦   ¦       eval_shap_range.py
+¦   ¦       __init__.py
+¦   ¦       
+¦   +---__pycache__
+¦           FTS_simple1.cpython-314.pyc
+¦           intent_tap.cpython-314.pyc
+¦           PSI_simple1.cpython-314.pyc
+¦           __init__.cpython-314.pyc
+¦           
++---core
+¦       drivers.py
+¦       registry.py
+¦       unit.py
+¦       
++---filters
+¦       filter1_float_watch.py
+¦       filter2_cameron_from_ross.py
+¦       ross_pillars.py
+¦       
++---io
+¦       parquet_writer.py
+¦       
++---patterns
+¦       bull_flag_from_ross.py
+¦       
++---routers
+¦   ¦   api.py
+¦   ¦   
+¦   +---__pycache__
+¦           api.cpython-312.pyc
+¦           
++---strategies
+¦       base.py
+¦       bullflag.py
+¦       __init__.py
+¦       
++---__pycache__
+        app.cpython-312.pyc
+        debug_ross_filter_tap.cpython-314.pyc
+        intent_tap.cpython-314.pyc
+        state.cpython-312.pyc
+        __init__.cpython-312.pyc
+        __init__.cpython-314.pyc
+        

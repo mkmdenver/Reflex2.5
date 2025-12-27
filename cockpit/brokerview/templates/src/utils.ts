@@ -1,0 +1,1 @@
+export function fmt(n:number,d=2){return n.toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d});}

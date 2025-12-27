@@ -1,0 +1,19 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Reflex2 DB Manager</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <h1>Reflex2 — Database Manager</h1>
+  <ul class="menu">
+    <li><a href="{{ url_for('init_db_form') }}">Initialize DB</a></li>
+    <li><a href="{{ url_for('symbol_editor_form') }}">Symbol Editor</a></li>
+    <li><a href="{{ url_for('finviz_prime_form') }}">Import Fundamentals (Finviz)</a></li>
+    <li><a href="{{ url_for('backfill_polygon_form') }}">Backfill (Polygon)</a></li>
+    <li><a href="{{ url_for('dashboard') }}">Dashboard</a></li>
+    <li><a href="{{ url_for('logs') }}">Service Metrics</a></li>
+  </ul>
+</body>
+</html>

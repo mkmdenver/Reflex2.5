@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Symbol Editor</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 20px; }
+    h1 { font-size: 1.4rem; margin-bottom: 0.5rem; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 16px; }
+    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    .row > * { margin: 4px 0; }
+    table { width: 100%; border-collapse: collapse; margin-top: 16px; }
+    th, td { border-bottom: 1px solid #eee; padding: 8px; text-align: left; font-size: 0.95rem; }
+    th { background: #fafafa; }
+    button { padding: 6px 10px; border: 1px solid #bbb; border-radius: 8px; background: #fff; cursor: pointer; }
+    button.primary { border-color: #0077ff; }
+    button.danger { border-color: #cc0000; color: #cc0000; }
+    select, input[type="text"] { padding: 6px 8px; border: 1px solid #bbb; border-radius: 8px; }
+    .muted { color: #666; font-size: 0.9rem; }
+  </style>
+</head>
+<body>
+  <h1>Symbol Editor</h1>
+  <div class="card">
+    <div class="row">
+      <input id="newSymbol" type="text" placeholder="Symbol (e.g., AAPL)" />
+      <label>DB-Tier:
+        <select id="newDbTier">
+          <option value="0">0 — cold</option>
+          <option value="1">1 — watch</option>
+          <option value="2">2 — warm</option>
+          <option value="3">3 — hot</option>
+        </select>
+      </label>
+      <label>
+        <input id="newDNT" type="checkbox" /> do_not_trade
+      </label>
+      <button class="primary" onclick="addSymbol()">Add / Upsert</button>
+      <span id="msg" class="muted"></span>
+    </div>
+
+    <table id="symTable">
+      <thead>
+        <tr>
+          <th style="width: 120px;">Symbol</th>
+          <th style="width: 180px;">DB-Tier</th>
+          <th style="width: 160px;">do_not_trade</th>
+          <th style="width: 200px;">Actions</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+<script>
+async function fetchJSON(url, opts={}) {
+  const res = await fetch(url, {headers: {"Content-Type": "application/json"}, ...opts});
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(`${res.status} ${res.statusText}: ${t}`);
+  }
+  return res.json();
+}
+
+function tierSelect(current) {
+  const select = document.createElement('select');
+  [0,1,2,3].forEach(v => {
+    const opt = document.createElement('option');
+    opt.value = v;
+    opt.textContent = `${v} — ${['cold','watch','warm','hot'][v]}`;
+    if (v === current) opt.selected = true;
+    select.appendChild(opt);
+  });
+  return select;
+}
+
+function checkbox(checked) {
+  const input = document.createElement('input');
+  input.type = 'checkbox';
+  input.checked = !!checked;
+  return input;
+}
+
+async function loadTable() {
+  const tbody = document.querySelector('#symTable tbody');
+  tbody.innerHTML = '';
+  const rows = await fetchJSON('/api/symbols');
+  for (const r of rows) {
+    const tr = document.createElement('tr');
+
+    // Symbol
+    const tdSym = document.createElement('td');
+    tdSym.textContent = r.symbol;
+    tr.appendChild(tdSym);
+
+    // DB-Tier
+    const tdTier = document.createElement('td');
+    const sel = tierSelect(r.db_tier);
+    tdTier.appendChild(sel);
+    tr.appendChild(tdTier);
+
+    // do_not_trade
+    const tdDnt = document.createElement('td');
+    const chk = checkbox(r.do_not_trade);
+    tdDnt.appendChild(chk);
+    tr.appendChild(tdDnt);
+
+    // Actions
+    const tdAct = document.createElement('td');
+
+    const btnSave = document.createElement('button');
+    btnSave.className = 'primary';
+    btnSave.textContent = 'Save';
+    btnSave.onclick = async () => {
+      try {
+        await fetchJSON(`/api/symbols/${encodeURIComponent(r.symbol)}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ db_tier: Number(sel.value), do_not_trade: chk.checked })
+        });
+        note(`Saved ${r.symbol}`);
+      } catch (e) { note(e.message, true); }
+    };
+
+    const btnDel = document.createElement('button');
+    btnDel.className = 'danger';
+    btnDel.style.marginLeft = '8px';
+    btnDel.textContent = 'Delete';
+    btnDel.onclick = async () => {
+      if (!confirm(`Delete ${r.symbol}?`)) return;
+      try {
+        await fetchJSON(`/api/symbols/${encodeURIComponent(r.symbol)}`, { method: 'DELETE' });
+        tr.remove();
+        note(`Deleted ${r.symbol}`);
+      } catch (e) { note(e.message, true); }
+    };
+
+    tdAct.appendChild(btnSave);
+    tdAct.appendChild(btnDel);
+    tr.appendChild(tdAct);
+
+    tbody.appendChild(tr);
+  }
+}
+
+async function addSymbol() {
+  const sym = document.getElementById('newSymbol').value.trim().toUpperCase();
+  const tier = Number(document.getElementById('newDbTier').value);
+  const dnt = document.getElementById('newDNT').checked;
+  if (!sym) { note('Enter a symbol', true); return; }
+
+  try {
+    await fetchJSON('/api/symbols', { method: 'POST', body: JSON.stringify({ symbol: sym, db_tier: tier, do_not_trade: dnt }) });
+    document.getElementById('newSymbol').value = '';
+    document.getElementById('newDbTier').value = '0';
+    document.getElementById('newDNT').checked = false;
+    await loadTable();
+    note(`Added/updated ${sym}`);
+  } catch (e) { note(e.message, true); }
+}
+
+function note(msg, isErr=false) {
+  const el = document.getElementById('msg');
+  el.textContent = msg;
+  el.style.color = isErr ? '#cc0000' : '#333';
+  setTimeout(() => { el.textContent=''; }, 2500);
+}
+
+loadTable();
+</script>
+</body>
+</html>

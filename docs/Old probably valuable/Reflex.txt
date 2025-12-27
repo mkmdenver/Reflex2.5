@@ -1,0 +1,41 @@
+Reflex
+
+This is a very drafty draft. Lots to add.
+this needs lots of clean up but is a first stab at this
+
+
+High Frequency trading system.
+
+.txt - General architecture notes
+.md  - Computer generated blueprints and formats
+.script - copies of GPT conversations
+
+
+# Reflex — Working Notes
+
+Live Trading (small-cap, high-momentum focus)
+
+- **Brokers:** Alpaca (live, paper), Webull, IB, Schwab LightSpeed.
+- **Model:** Multiple. Most are multiple stage. Filter then pattern. 
+- **Capital:** Start small, scale with observed performance and slippage.
+
+Programming Rules / Notes
+- Platform: **Windows‑only**; Python primary; VS Code.
+- Data: Polygon (REST/WebSocket); Timescale DB; **MongoDB later** (JSON for now).
+- Imports robust; ensure `pip install` guidance where needed.
+- **No stubs** — production‑quality code unless explicitly in mockup mode.
+
+- 
+ 
+datahub - Source for all TimeDataDB (ie symbol price/vol). 
+	- Multiple data sources. Polygon primary.
+	- State transitions: **COLD → WATCH → WARM → HOT**
+	- Maintains in memory copy of current days values and history
+	- Records fundamental, daily, min, tick are saved live. quotes in memory only
+	- There can be multiple data client Realtime
+.
+	- Garnet for data backbone.
+	- Use shared streams for broad feeds, per-symbol streams only for a small “focus set”.
+
+
+---

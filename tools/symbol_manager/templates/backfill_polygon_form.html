@@ -1,0 +1,40 @@
+<!--
+=============================================================================
+templates/backfill_polygon_form.html
+Version: 2025.10.22-rc2
+
+CHANGELOG
+- 2025-10-22: rc2
+  • Removed obsolete 'target' field.
+  • Form now feeds controller with (symbol, mode) only.
+  • Added explicit 'ALL' hint and 'all' mode.
+=============================================================================
+-->
+{% extends "base.html" %}
+{% block content %}
+<h1>Polygon Backfill</h1>
+
+<form method="post" class="form">
+  <div class="grid">
+    <label>Symbol
+      <input type="text" name="symbol" placeholder="e.g., AAPL (blank or 'ALL' = all symbols)">
+    </label>
+    <label>Mode
+      <select name="mode">
+        <option value="recent" selected>recent (last N days)</option>
+        <option value="moderate">moderate (mid-range)</option>
+        <option value="full">full (complete history)</option>
+        <option value="all">all (force ALL symbols run)</option>
+      </select>
+    </label>
+  </div>
+  <div class="actions">
+    <button type="submit">Start Backfill</button>
+  </div>
+</form>
+
+<p class="note">
+Behavior: If symbol is empty or 'ALL', or if mode is 'all', the controller runs the selected mode across <strong>all symbols</strong>.
+For any single-symbol run, the controller refreshes fundamentals for that symbol.
+</p>
+{% endblock %}
