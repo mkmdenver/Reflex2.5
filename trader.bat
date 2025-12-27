@@ -7,7 +7,7 @@ pushd "%ROOT%"
 echo [RUNNING] %~f0
 
 rem --- Load root .env (env.bat REQUIRES a file path arg) ---
-call "%ROOT%env.bat" "%ROOT%.env"
+call "%ROOT%env.bat" "%ROOT%\.env"
 if errorlevel 1 (
   echo [ERROR] env.bat failed. Expected: call env.bat path\to\.env
   popd
