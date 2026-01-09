@@ -13,15 +13,14 @@ import logging
 import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.responses import StreamingResponse
 
 from .market_session import current_session
 from .models import (
@@ -36,10 +35,6 @@ from .models import (
 )
 
 log = logging.getLogger("brokerview")
-
-# ---------------------------------------------------------------------------
-# Simple env / config
-# ---------------------------------------------------------------------------
 
 
 def _env(name: str, default: Optional[str] = None) -> str:
@@ -56,16 +51,7 @@ TRADER_BASE = _env("TRADER_BASE", f"http://127.0.0.1:{TRADER_API_PORT}")
 # ROOT for static/templates
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
-log.info(
-    "BrokerView config port=%s trader_base=%s root=%s",
-    BROKERVIEW_PORT,
-    TRADER_BASE,
-    ROOT,
-)
-
-# ---------------------------------------------------------------------------
-# Order payload going *to* Trader
-# ---------------------------------------------------------------------------
+log.info("BrokerView config port=%s trader_base=%s root=%s", BROKERVIEW_PORT, TRADER_BASE, ROOT)
 
 
 class OrderIn(BaseModel):
@@ -93,10 +79,6 @@ class OrderIn(BaseModel):
         populate_by_name = True
 
 
-# ---------------------------------------------------------------------------
-# FastAPI app + CORS + static
-# ---------------------------------------------------------------------------
-
 app = FastAPI(title="BrokerView")
 
 app.add_middleware(
@@ -112,29 +94,20 @@ static_dir = os.path.join(ROOT, "cockpit", "brokerview", "templates", "dist", "a
 if os.path.isdir(static_dir):
     app.mount("/assets", StaticFiles(directory=static_dir), name="assets")
 
-# ---------------------------------------------------------------------------
-# API: Time (used by UI clock sync)
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# API: Time (used by UI clock sync) — proxy Trader/DataHub authority
-# ---------------------------------------------------------------------------
 
 @app.get("/v1/time")
 async def time_now() -> Dict[str, Any]:
     """
     Return authoritative time for UI sync.
 
-    Desired truth chain:
-      DataHub (authoritative tick) -> Trader cache (/v1/time) -> BrokerView proxy -> UI offset
+    Truth chain:
+      Trader (/v1/time) -> BrokerView proxy -> UI offset
     """
-    # Try Trader first (authoritative)
     try:
         async with httpx.AsyncClient(timeout=5) as cli:
             r = await cli.get(f"{TRADER_BASE}/v1/time")
             r.raise_for_status()
             data = r.json()
-            # Ensure a source tag is present for UI display/debug
             if isinstance(data, dict) and "source" not in data:
                 data["source"] = "trader"
             return data
@@ -151,39 +124,17 @@ async def time_now() -> Dict[str, Any]:
         }
 
 
-# ---------------------------------------------------------------------------
-# HTML root – serve the SPA shell
-# ---------------------------------------------------------------------------
-
-
 @app.get("/", response_class=HTMLResponse)
 async def index() -> str:
-    index_html = os.path.join(
-        ROOT, "cockpit", "brokerview", "templates", "dist", "index.html"
-    )
+    index_html = os.path.join(ROOT, "cockpit", "brokerview", "templates", "dist", "index.html")
     with open(index_html, "r", encoding="utf-8") as f:
         return f.read()
 
 
-# ---------------------------------------------------------------------------
-# API: Market session
-# ---------------------------------------------------------------------------
-
 @app.get("/v1/market/session", response_model=MarketSessionDoc)
 async def market_session() -> MarketSessionDoc:
-    """
-    Normalize raw session info from Trader into the schema expected by
-    MarketSessionDoc. Trader / exchange libs may report states like
-    "OPEN"/"CLOSED" etc; the UI model only knows:
-        - "closed"
-        - "premarket"
-        - "regular"
-        - "postmarket"
-    and requires a "now" field.
-    """
     raw = await current_session()
 
-    # Defensive: allow both upper/lower/mixed state strings from upstream
     raw_state = str(raw.get("state", "")).strip()
     raw_state_upper = raw_state.upper()
 
@@ -196,33 +147,23 @@ async def market_session() -> MarketSessionDoc:
     elif raw_state_upper in ("POSTMARKET", "POST", "AFTER_HOURS", "AFTERHOURS"):
         state = "postmarket"
     else:
-        # If we ever see an unknown state, fall back to "closed"
         state = "closed"
 
-    # Prefer an explicit "now"/"server_time" from upstream; otherwise use current UTC
+    # Prefer explicit "now" from upstream, else current UTC
     now_val = raw.get("now") or raw.get("server_time")
     if isinstance(now_val, str):
         try:
-            from datetime import datetime, timezone
-
-            # Handle ISO8601 with or without "Z"
             cleaned = now_val.replace("Z", "+00:00") if "Z" in now_val and "+" not in now_val else now_val
             now_dt = datetime.fromisoformat(cleaned)
             if now_dt.tzinfo is None:
                 now_dt = now_dt.replace(tzinfo=timezone.utc)
         except Exception:
-            from datetime import datetime, timezone
-
             now_dt = datetime.now(timezone.utc)
     elif now_val is not None:
         now_dt = now_val
     else:
-        from datetime import datetime, timezone
-
         now_dt = datetime.now(timezone.utc)
 
-    # MarketSessionDoc likely ignores extra fields, so we pass through anything
-    # useful like regular_open / regular_close / note.
     return MarketSessionDoc(
         state=state,
         now=now_dt,
@@ -232,19 +173,11 @@ async def market_session() -> MarketSessionDoc:
     )
 
 
-
-# ---------------------------------------------------------------------------
-# API: Accounts + overview
-# ---------------------------------------------------------------------------
-
-
 @app.get("/v1/accounts", response_model=AccountsResponse)
 async def accounts() -> AccountsResponse:
     """
     UI-facing account overview.
-
-    We call Trader’s /v1/portfolio/overview and normalize into
-    a simple [AccountSummary] list so the React side can stay dumb and happy.
+    Calls Trader’s /v1/portfolio/overview and normalizes into [AccountSummary].
     """
     url = f"{TRADER_BASE}/v1/portfolio/overview"
     async with httpx.AsyncClient(timeout=10) as client:
@@ -258,7 +191,7 @@ async def accounts() -> AccountsResponse:
         raw = resp.json()
         overview = PortfolioOverview(**raw)
 
-        accounts: List[AccountSummary] = []
+        out: List[AccountSummary] = []
         for account_id, ov in overview.overview.items():
             balances = ov.balances
             cash = balances.cash or 0.0
@@ -270,14 +203,13 @@ async def accounts() -> AccountsResponse:
             acct_type = acct_type or "unknown"
 
             label = f"{broker.capitalize()} {acct_type.capitalize()}"
-
             status = "ACTIVE"
             if broker == "sim":
                 status = "SIM"
             elif broker == "alpaca":
                 status = "LIVE"
 
-            accounts.append(
+            out.append(
                 AccountSummary(
                     account_id=account_id,
                     label=label,
@@ -292,22 +224,16 @@ async def accounts() -> AccountsResponse:
                 )
             )
 
-        return AccountsResponse(accounts=accounts)
-
-
-# ---------------------------------------------------------------------------
-# API: Positions – proxied from Trader
-# ---------------------------------------------------------------------------
+        return AccountsResponse(accounts=out)
 
 
 @app.get("/v1/positions", response_model=PositionsResponse)
 async def positions(account: Optional[str] = None) -> PositionsResponse:
-    """Proxy positions from Trader.
-
-    The UI sends `?account=<account_id>` (historical naming).
-    Trader expects `?account_id=<account_id>`.
     """
-    params = {}
+    Proxy positions from Trader.
+    UI sends ?account=<account_id>; Trader expects ?account_id=<account_id>.
+    """
+    params: Dict[str, Any] = {}
     if account:
         params["account_id"] = account
 
@@ -349,93 +275,83 @@ async def positions(account: Optional[str] = None) -> PositionsResponse:
         return PositionsResponse(positions=docs)
 
 
-# ---------------------------------------------------------------------------
-# API: Orders – proxied from Trader
-# ---------------------------------------------------------------------------
-
-
 @app.get("/v1/orders", response_model=OrdersResponse)
-async def orders(status: str = "all") -> OrdersResponse:
+async def orders(status: str = "all", account: Optional[str] = None) -> OrdersResponse:
     """
-    Proxy active/closed orders from Trader and normalize into OrderDoc.
+    Proxy orders from Trader and normalize into OrderDoc.
+
+    Supports:
+      - active
+      - closed
+      - all (active + closed)
+
+    IMPORTANT: passes selected account to Trader so it doesn't scan all accounts.
     """
+    want_all = str(status or "").lower() == "all"
+    params_base: Dict[str, Any] = {}
+    if account:
+        params_base["account_id"] = account
+
     async with httpx.AsyncClient(timeout=10) as client:
         try:
-            resp = await client.get(f"{TRADER_BASE}/v1/orders", params={"status": status})
-            resp.raise_for_status()
+            if want_all:
+                p1 = dict(params_base, status="active")
+                p2 = dict(params_base, status="closed")
+                r1 = await client.get(f"{TRADER_BASE}/v1/orders", params=p1)
+                r2 = await client.get(f"{TRADER_BASE}/v1/orders", params=p2)
+                r1.raise_for_status()
+                r2.raise_for_status()
+                raw_orders = (r1.json().get("orders") or []) + (r2.json().get("orders") or [])
+            else:
+                p = dict(params_base, status=status)
+                resp = await client.get(f"{TRADER_BASE}/v1/orders", params=p)
+                resp.raise_for_status()
+                raw_orders = resp.json().get("orders") or []
         except httpx.HTTPError as e:
             log.exception("Error fetching orders from Trader: %s", e)
             raise HTTPException(status_code=502, detail="Trader unavailable")
 
-        raw = resp.json()
-        docs: List[OrderDoc] = []
-        for o in raw.get("orders", []):
-            docs.append(
-                OrderDoc(
-                    account_id=o.get("account_id", ""),
-                    symbol=o.get("symbol", ""),
-                    side=o.get("side"),
-                    status=o.get("status"),
-                    type=o.get("type"),
-                    qty=o.get("qty"),
-                    filled_qty=o.get("filled_qty"),
-                    limit_price=o.get("limit_price"),
-                    stop_price=o.get("stop_price"),
-                    time_in_force=o.get("time_in_force"),
-                    submitted_at=o.get("submitted_at"),
-                    updated_at=o.get("updated_at"),
-                    broker_order_id=o.get("broker_order_id") or o.get("id"),
-                    client_order_id=o.get("client_order_id"),
-                    raw=o,
-                )
+    docs: List[OrderDoc] = []
+    for o in raw_orders:
+        docs.append(
+            OrderDoc(
+                account_id=o.get("account_id", ""),
+                symbol=o.get("symbol", ""),
+                side=o.get("side"),
+                status=o.get("status"),
+                type=o.get("type"),
+                qty=o.get("qty"),
+                filled_qty=o.get("filled_qty"),
+                limit_price=o.get("limit_price"),
+                stop_price=o.get("stop_price"),
+                time_in_force=o.get("time_in_force"),
+                submitted_at=o.get("submitted_at"),
+                updated_at=o.get("updated_at"),
+                broker_order_id=o.get("broker_order_id") or o.get("id"),
+                client_order_id=o.get("client_order_id"),
+                raw=o,
             )
+        )
 
-        return OrdersResponse(orders=docs)
-
-
-# ---------------------------------------------------------------------------
-# API: Place order – UI → BrokerView → Trader
-# ---------------------------------------------------------------------------
+    return OrdersResponse(orders=docs)
 
 
 @app.post("/v1/orders")
 async def place_order(order: OrderIn) -> Dict[str, Any]:
-    """
-    Entry point for the React order ticket.
-
-    - Normalize incoming order (symbol/qty/etc)
-    - Forward to Trader `/v1/orders/place`
-    - Bubble up any error text from Trader
-    """
     payload = order.model_dump(by_alias=True)
     payload["note"] = payload.get("note") or ""
-
-    log.info("BrokerView place_order -> Trader payload=%s", payload)
 
     url = f"{TRADER_BASE}/v1/orders/place"
     async with httpx.AsyncClient(timeout=20) as cli:
         try:
             resp = await cli.post(url, json=payload)
             resp.raise_for_status()
-            data = resp.json()
-            log.info("Trader accepted order: %s", data)
-            return data
+            return resp.json()
         except httpx.HTTPStatusError as e:
-            text = e.response.text
-            log.warning(
-                "Trader rejected order status=%s body=%s",
-                e.response.status_code,
-                text,
-            )
-            raise HTTPException(status_code=e.response.status_code, detail=text)
+            raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
         except httpx.HTTPError as e:
             log.exception("Error talking to Trader /v1/orders/place: %s", e)
             raise HTTPException(status_code=502, detail="Trader unavailable")
-
-
-# ---------------------------------------------------------------------------
-# API: Account-level actions – flatten / cancel all
-# ---------------------------------------------------------------------------
 
 
 class AccountActionIn(BaseModel):
@@ -444,15 +360,9 @@ class AccountActionIn(BaseModel):
 
 @app.post("/v1/accounts/flatten")
 async def flatten_account(body: AccountActionIn) -> Dict[str, Any]:
-    """
-    Ask Trader to flatten all positions for an account.
-    """
     async with httpx.AsyncClient(timeout=20) as cli:
         try:
-            resp = await cli.post(
-                f"{TRADER_BASE}/v1/accounts/flatten",
-                json={"account_id": body.account_id},
-            )
+            resp = await cli.post(f"{TRADER_BASE}/v1/accounts/flatten", json={"account_id": body.account_id})
             resp.raise_for_status()
             return resp.json()
         except httpx.HTTPError as e:
@@ -462,34 +372,27 @@ async def flatten_account(body: AccountActionIn) -> Dict[str, Any]:
 
 @app.post("/v1/accounts/cancel_all")
 async def cancel_all(body: AccountActionIn) -> Dict[str, Any]:
-    """
-    Ask Trader to cancel all open orders for an account.
-    """
     async with httpx.AsyncClient(timeout=20) as cli:
         try:
-            resp = await cli.post(
-                f"{TRADER_BASE}/v1/accounts/cancel_all",
-                json={"account_id": body.account_id},
-            )
+            resp = await cli.post(f"{TRADER_BASE}/v1/accounts/cancel_all", json={"account_id": body.account_id})
             resp.raise_for_status()
             return resp.json()
         except httpx.HTTPError as e:
             log.exception("Error cancel_all via Trader: %s", e)
             raise HTTPException(status_code=502, detail="Trader unavailable")
+
+
 @app.get("/events")
 async def proxy_events(request: Request):
     """Proxy Trader SSE stream to the browser (avoids CORS issues)."""
     url = f"{TRADER_BASE}/v1/events"
-    async with httpx.AsyncClient(timeout=None) as cli:
-        r = await cli.stream("GET", url, headers={"Accept": "text/event-stream"})
 
-        async def _iter():
-            async for chunk in r.aiter_raw():
-                if await request.is_disconnected():
-                    break
-                yield chunk
+    async def _iter():
+        async with httpx.AsyncClient(timeout=None) as cli:
+            async with cli.stream("GET", url, headers={"Accept": "text/event-stream"}) as r:
+                async for chunk in r.aiter_raw():
+                    if await request.is_disconnected():
+                        break
+                    yield chunk
 
-        return StreamingResponse(_iter(), media_type="text/event-stream")
-
-
-
+    return StreamingResponse(_iter(), media_type="text/event-stream")

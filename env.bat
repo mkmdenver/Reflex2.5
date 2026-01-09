@@ -1,33 +1,36 @@
 @echo off
-setlocal EnableExtensions EnableDelayedExpansion
+REM env.bat — load .env and .env.local into the CURRENT process environment.
+REM IMPORTANT: Do NOT use setlocal/endlocal at top-level, or env vars vanish on return.
 
-REM Resolve project root (env.bat lives at root)
 set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 
-set "ENV_FILE=%ROOT%\.env"
-set "LOCAL_FILE=%ROOT%\.env.local"
+REM If caller passes a specific file path, load only that file.
+if not "%~1"=="" (
+  call :load_file "%~1"
+  goto :eof
+)
 
-call :load_env "%ENV_FILE%"
-call :load_env "%LOCAL_FILE%"
+REM Default: load root .env then .env.local
+call :load_file "%ROOT%\.env"
+if exist "%ROOT%\.env.local" call :load_file "%ROOT%\.env.local"
 
-endlocal & goto :eof
+goto :eof
 
-:load_env
+
+:load_file
 set "FILE=%~1"
 if not exist "%FILE%" goto :eof
 
 for /f "usebackq delims=" %%L in ("%FILE%") do (
-    set "LINE=%%L"
-    if not "!LINE!"=="" (
-        if not "!LINE:~0,1!"=="#" (
-            for /f "tokens=1* delims==" %%A in ("!LINE!") do (
-                set "K=%%A"
-                set "V=%%B"
-                if "!V:~0,1!"=="^"" if "!V:~-1!"=="^"" set "V=!V:~1,-1!"
-                set "!K!=!V!"
-            )
-        )
+  set "LINE=%%L"
+  if not "%LINE%"=="" (
+    if not "%LINE:~0,1%"=="#" (
+      for /f "tokens=1* delims==" %%A in ("%%L") do (
+        if not "%%A"=="" set "%%A=%%B"
+      )
     )
+  )
 )
+
 goto :eof
