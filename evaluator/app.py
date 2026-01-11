@@ -216,6 +216,23 @@ async def post_order_intent(req: OrderIntentRequest, response: Response):
 
     This is *not* the BrokerView UI path – that goes directly to Trader.
     """
+
+    log.info(
+    "trader.intent.http_rx",
+    extra={
+        "symbol": req.intent.symbol,
+        "side": req.intent.side,
+        "strategy_id": req.intent.client_tag,
+        "source": "evaluator",
+        "strength": None,
+        "account_id": req.intent.account_id,
+    },
+)
+        "strength": intent.get("strength"),
+        "account_id": intent.get("account_id"),
+    },
+)
+
     if not await _capacity_allow():
         response.status_code = status.HTTP_429_TOO_MANY_REQUESTS
         return {

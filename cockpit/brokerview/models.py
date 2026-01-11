@@ -36,6 +36,8 @@ class MarketSessionDoc(BaseModel):
     regular_open: Optional[datetime] = None
     regular_close: Optional[datetime] = None
     post_close: Optional[datetime] = None
+    stop_price: Optional[float] = None
+    target_price: Optional[float] = None
 
     notes: Optional[str] = None
 

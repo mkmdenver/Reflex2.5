@@ -269,6 +269,8 @@ async def positions(account: Optional[str] = None) -> PositionsResponse:
                     realized_pl=p.get("realized_pl"),
                     side=side,
                     raw=p,
+                    stop_price=p.get("stop_price"),
+                    target_price=p.get("target_price"),     
                 )
             )
 
@@ -363,11 +365,20 @@ async def flatten_account(body: AccountActionIn) -> Dict[str, Any]:
     async with httpx.AsyncClient(timeout=20) as cli:
         try:
             resp = await cli.post(f"{TRADER_BASE}/v1/accounts/flatten", json={"account_id": body.account_id})
-            resp.raise_for_status()
+            # If Trader returned a real error, propagate it (don't lie as "unavailable")
+            if resp.status_code >= 400:
+                raise HTTPException(status_code=resp.status_code, detail=resp.text)
             return resp.json()
+        except httpx.ConnectError as e:
+            log.exception("Error flattening account via Trader (connect): %s", e)
+            raise HTTPException(status_code=502, detail="Trader unavailable")
+        except httpx.ReadTimeout as e:
+            log.exception("Error flattening account via Trader (timeout): %s", e)
+            raise HTTPException(status_code=502, detail="Trader timeout")
         except httpx.HTTPError as e:
             log.exception("Error flattening account via Trader: %s", e)
             raise HTTPException(status_code=502, detail="Trader unavailable")
+
 
 
 @app.post("/v1/accounts/cancel_all")

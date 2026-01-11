@@ -1,27 +1,32 @@
 # trader/broker_worker.py
-# Version: 2025-12-04
+# Version: 2026-01-09 (patched)
 # Purpose:
-#   Bridge Evaluator "order intents" on Redis -> Trader HTTP /v1/orders.
-#   Runs as a small, Windows-friendly async worker with good logging.
+#   Bridge Evaluator intents on Redis -> Trader HTTP /v1/intents (NEW standard).
 #
 # Notes:
-#   • Supports BOTH legacy "flat" intents and new envelope-shaped messages:
-#         { "symbol": "...", "side": "...", ... }
-#      or:
-#         { "intent": { ... }, "meta": { "model": "...", "strength": 1.0, ... } }
-#   • account_id always comes from the intent payload; a single Trader process
-#     can talk to many broker accounts and receive intents from many bots.
+#   • Supports BOTH legacy "order-ish" intents and new Intent-v1 messages:
+#       Legacy flat:
+#         { "symbol": "...", "side": "...", "qty": 10, "type": "market", ... }
+#       Envelope:
+#         { "intent": { ... }, "meta": { "model": "...", ... } }
+#       New Intent v1:
+#         { "intent_id": "...", "symbol": "...", "side": "...", "strength": 0.7,
+#           "strategy_id": "...", "risk_hints": {...}, ... }
+#   • qty/shares are NOT required here anymore. Trader is the authority that
+#     sizes (Risk/Capital) and compiles orders.
+#   • account_id is optional (directed intent). If missing, Trader assigns.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import contextlib
 import os
-import sys
-import argparse
 import platform
 import signal
-from typing import Optional, Dict, Any
+import sys
+import time
+from typing import Optional, Dict, Any, Tuple
 
 import httpx
 
@@ -44,112 +49,185 @@ def _trader_base_url() -> str:
     return base.rstrip("/")
 
 
-# ---------------------------------------------------------------------------
-# Intent forwarding
-# ---------------------------------------------------------------------------
+def _intent_endpoint_path() -> str:
+    # Default to NEW canonical endpoint
+    return os.getenv("TRADER_INTENT_PATH", "/v1/intents").strip() or "/v1/intents"
 
-async def _forward_intent_to_trader(
-    intent: Dict[str, Any],
-    meta: Optional[Dict[str, Any]] = None,
-) -> None:
+
+def _utc_iso_now() -> str:
+    # Good enough for tracing. Trader may re-stamp.
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + f".{int((time.time() % 1) * 1000):03d}Z"
+
+
+def _normalize_envelope(payload: Any) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
     """
-    Take a normalized intent from Redis and POST it to Trader /v1/orders.
-
-    We log both the outgoing payload and any error body from Trader so
-    that we can debug things like "adapter does not support place_order".
+    Normalize incoming bus payload into (intent_dict, meta_dict).
+    Supports:
+      - legacy flat: payload is the intent
+      - envelope: {intent:{...}, meta:{...}}
     """
-    meta = meta or {}
+    meta: Dict[str, Any] = {}
 
-    # account_id is supplied by the eval bot / strategy; this is how one
-    # Trader instance can talk to many accounts.
-    account_id = (intent.get("account_id") or "").strip()
-    if not account_id:
-        # Fallback: env default, then sim:cash for safety.
-        account_id = os.getenv("TRADER_DEFAULT_ACCOUNT_ID", "sim:cash")
+    if isinstance(payload, dict) and "intent" in payload:
+        inner = payload.get("intent") or {}
+        if not isinstance(inner, dict):
+            return None, {}
+        intent = inner
+        m = payload.get("meta") or {}
+        if isinstance(m, dict):
+            meta = m
+        return intent, meta
 
-    symbol = intent.get("symbol")
+    if isinstance(payload, dict):
+        return payload, meta
+
+    return None, {}
+
+
+def _legacy_to_intent_v1(intent: Dict[str, Any], meta: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert legacy order-ish intent into Intent v1.
+    Legacy fields (qty/type/tif) become hints in meta, not requirements.
+    """
+    sym = intent.get("symbol")
     side = intent.get("side")
-    qty = intent.get("qty")
 
-    # Minimal sanity log of what we think we're doing
+    out: Dict[str, Any] = {
+        "intent_id": intent.get("intent_id") or intent.get("id") or "",
+        "ts": intent.get("ts") or _utc_iso_now(),
+        "symbol": sym,
+        "side": side,
+        "source": intent.get("source") or "bot",
+        "strategy_id": intent.get("strategy_id") or meta.get("model") or "unknown",
+        "strength": intent.get("strength") or meta.get("strength") or 0.5,
+        "urgency": intent.get("urgency") or "normal",
+        "trigger": intent.get("trigger") or {"kind": "immediate"},
+        "reason": intent.get("reason") or intent.get("note") or "",
+        "tags": intent.get("tags") or ([meta.get("model")] if meta.get("model") else []),
+    }
+
+    if intent.get("account_id"):
+        out["account_id"] = intent.get("account_id")
+
+    legacy_hints: Dict[str, Any] = {}
+    if intent.get("qty") is not None:
+        legacy_hints["requested_qty_legacy"] = intent.get("qty")
+    if intent.get("type"):
+        legacy_hints["order_type_legacy"] = intent.get("type")
+    tif = intent.get("time_in_force") or intent.get("tif")
+    if tif:
+        legacy_hints["tif_legacy"] = tif
+    if intent.get("extended_hours") is not None:
+        legacy_hints["extended_hours_legacy"] = bool(intent.get("extended_hours"))
+
+    if legacy_hints:
+        out["meta"] = {"legacy": legacy_hints}
+
+    return out
+
+
+def _ensure_intent_v1(intent: Dict[str, Any], meta: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Ensure outgoing payload is Intent v1.
+    - If legacy order-ish, convert.
+    - If already v1-ish, keep and attach envelope meta.
+    """
+    if ("qty" in intent) or ("time_in_force" in intent) or ("tif" in intent) or ("type" in intent):
+        return _legacy_to_intent_v1(intent, meta)
+
+    out = dict(intent)
+    out.setdefault("ts", _utc_iso_now())
+
+    if meta:
+        out.setdefault("meta", {})
+        if isinstance(out["meta"], dict):
+            out["meta"].setdefault("model", meta.get("model"))
+            for k, v in meta.items():
+                if k not in out["meta"]:
+                    out["meta"][k] = v
+
+    return out
+
+
+async def _ps_aclose(ps: Any) -> None:
+    """
+    redis-py deprecated close(); new is aclose().
+    Use whichever exists to avoid warnings.
+    """
+    if hasattr(ps, "aclose"):
+        await ps.aclose()
+    else:
+        await ps.close()
+
+
+# ---------------------------------------------------------------------------
+# Intent forwarding (NEW: /v1/intents)
+# ---------------------------------------------------------------------------
+
+async def _forward_intent_to_trader(intent_v1: Dict[str, Any]) -> None:
+    """
+    POST Intent v1 to Trader /v1/intents (or env override).
+    Trader is responsible for Risk sizing + Plan compilation + execution.
+    """
+    symbol = intent_v1.get("symbol")
+    side = intent_v1.get("side")
+    intent_id = intent_v1.get("intent_id") or ""
+
     log.info(
         "broker_worker.intent.forward",
         extra={
-            "account_id": account_id,
             "symbol": symbol,
             "side": side,
-            "qty": qty,
-            "meta_model": meta.get("model"),
-            "meta_strength": meta.get("strength"),
-            "meta_risk": meta.get("risk"),
+            "intent_id": intent_id,
+            "strategy_id": intent_v1.get("strategy_id"),
+            "strength": intent_v1.get("strength"),
+            "account_id": intent_v1.get("account_id"),
         },
     )
 
-    if not symbol or not side or not qty:
+    if not symbol or not side:
         log.error(
             "broker_worker.intent.missing_fields",
-            extra={
-                "account_id": account_id,
-                "symbol": symbol,
-                "side": side,
-                "qty": qty,
-                "intent": intent,
-            },
+            extra={"symbol": symbol, "side": side, "intent": intent_v1},
         )
         return
 
-    payload: Dict[str, Any] = {
-        "account_id": account_id,
-        "symbol": symbol,
-        "side": side,
-        "qty": qty,
-        "type": intent.get("type", "market"),
-        "time_in_force": intent.get("time_in_force")
-                         or intent.get("tif")
-                         or "day",
-        "limit_price": intent.get("limit_price"),
-        "stop_price": intent.get("stop_price"),
-        "trail": intent.get("trail"),
-        "extended_hours": bool(intent.get("extended_hours", False)),
-        "note": intent.get("note") or intent.get("reason") or "",
-    }
-
-    # Attach a free-form intent_id if present for traceability.
-    if intent.get("intent_id"):
-        payload["intent_id"] = intent["intent_id"]
-
-    url = _trader_base_url() + "/v1/orders"
+    url = _trader_base_url() + _intent_endpoint_path()
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(url, json=payload)
+            resp = await client.post(url, json=intent_v1)
     except Exception as exc:
         log.exception(
             "broker_worker.intent.http_error",
-            extra={"account_id": account_id, "error": repr(exc), "url": url},
+            extra={"error": repr(exc), "url": url, "intent_id": intent_id, "symbol": symbol},
         )
         return
 
-    # Always try to capture the body for debugging
-    try:
-        body: Any = resp.json()
-    except Exception:
-        with contextlib.suppress(Exception):
-            body = resp.text  # type: ignore[assignment]
-        if body is None:
-            body = "<no-body>"
+    # Always capture body text for debugging (Trader 400/422 etc.)
+    resp_text: str = ""
+    with contextlib.suppress(Exception):
+        resp_text = resp.text
+
+    # Try JSON body too (FastAPI validation errors are usually JSON)
+    body: Any = None
+    with contextlib.suppress(Exception):
+        body = resp.json()
 
     if resp.status_code != 200:
+        log.error(f"broker_worker.intent.trader_error status={resp.status_code} url={url} text={resp_text}")
+
         log.error(
             "broker_worker.intent.trader_error",
             extra={
                 "status": resp.status_code,
-                "account_id": account_id,
+                "url": url,
+                "intent_id": intent_id,
                 "symbol": symbol,
                 "side": side,
-                "qty": qty,
-                "payload": payload,
                 "body": body,
+                "text": resp_text,
+                "payload": intent_v1,
             },
         )
         return
@@ -158,10 +236,9 @@ async def _forward_intent_to_trader(
         "broker_worker.intent.applied",
         extra={
             "status": resp.status_code,
-            "account_id": account_id,
+            "intent_id": intent_id,
             "symbol": symbol,
             "side": side,
-            "qty": qty,
             "body": body,
         },
     )
@@ -173,10 +250,7 @@ async def _forward_intent_to_trader(
 
 async def _intent_loop(instance: str, stop_event: asyncio.Event) -> None:
     channel = CHANNELS["order"]
-    log.info(
-        "broker_worker.intent_loop.start",
-        extra={"instance": instance, "channel": channel},
-    )
+    log.info("broker_worker.intent_loop.start", extra={"instance": instance, "channel": channel})
 
     ps = await subscribe(channel)
 
@@ -191,64 +265,40 @@ async def _intent_loop(instance: str, stop_event: asyncio.Event) -> None:
             try:
                 payload = unpack(raw)
             except Exception as exc:
-                log.exception(
-                    "broker_worker.intent.unpack_error",
-                    extra={"error": repr(exc)},
-                )
+                log.exception("broker_worker.intent.unpack_error", extra={"error": repr(exc)})
                 continue
 
-            # Support both:
-            #   • legacy flat intents: payload is the intent
-            #   • new envelopes: { "intent": {...}, "meta": {...} }
-            meta: Dict[str, Any] = {}
-            if isinstance(payload, dict) and "intent" in payload:
-                inner = payload.get("intent") or {}
-                if not isinstance(inner, dict):
-                    log.error(
-                        "broker_worker.intent.bad_envelope",
-                        extra={"payload_type": type(payload).__name__},
-                    )
-                    continue
-                intent = inner
-                meta = payload.get("meta") or {}
-                if not isinstance(meta, dict):
-                    meta = {}
-            else:
-                intent = payload  # legacy case
-
-            if not isinstance(intent, dict):
+            intent_raw, meta = _normalize_envelope(payload)
+            if intent_raw is None or not isinstance(intent_raw, dict):
                 log.error(
                     "broker_worker.intent.bad_payload_type",
-                    extra={"payload_type": type(intent).__name__},
+                    extra={"payload_type": type(payload).__name__},
                 )
                 continue
 
-            # Quick breadcrumb for traceability; payload details are in
-            # _forward_intent_to_trader().
-            log.debug(
-                "broker_worker.intent.recv",
+            intent_v1 = _ensure_intent_v1(intent_raw, meta)
+
+            log.info(
+                "broker_worker.intent.rx",
                 extra={
                     "instance": instance,
-                    "account_id": intent.get("account_id"),
-                    "symbol": intent.get("symbol"),
-                    "side": intent.get("side"),
-                    "qty": intent.get("qty"),
-                    "meta_model": meta.get("model"),
-                    "meta_strength": meta.get("strength"),
-                    "meta_risk": meta.get("risk"),
+                    "intent_id": intent_v1.get("intent_id"),
+                    "symbol": intent_v1.get("symbol"),
+                    "side": intent_v1.get("side"),
+                    "strategy_id": intent_v1.get("strategy_id"),
+                    "strength": intent_v1.get("strength"),
+                    "account_id": intent_v1.get("account_id"),
                 },
             )
 
-            await _forward_intent_to_trader(intent, meta)
+            await _forward_intent_to_trader(intent_v1)
+
     finally:
         with contextlib.suppress(Exception):
             await ps.unsubscribe(channel)
         with contextlib.suppress(Exception):
-            await ps.close()
-        log.info(
-            "broker_worker.intent_loop.stop",
-            extra={"instance": instance, "channel": channel},
-        )
+            await _ps_aclose(ps)
+        log.info("broker_worker.intent_loop.stop", extra={"instance": instance, "channel": channel})
 
 
 # ---------------------------------------------------------------------------
@@ -256,52 +306,27 @@ async def _intent_loop(instance: str, stop_event: asyncio.Event) -> None:
 # ---------------------------------------------------------------------------
 
 async def worker_main(instance: str, stop_event: Optional[asyncio.Event] = None) -> None:
-    """
-    Main async body of the broker worker.
-
-    We keep this intentionally small: set up the stop_event and run the
-    Redis intent loop. All the interesting work is in _intent_loop().
-    """
     if stop_event is None:
         stop_event = asyncio.Event()
 
-    log.info(
-        "broker_worker.start",
-        extra={"instance": instance, "redis": get_redis_url()},
-    )
+    log.info("broker_worker.start", extra={"instance": instance, "redis": get_redis_url()})
 
     try:
         await _intent_loop(instance, stop_event)
     except asyncio.CancelledError:
-        log.info(
-            "broker_worker.cancelled",
-            extra={"instance": instance},
-        )
+        log.info("broker_worker.cancelled", extra={"instance": instance})
     except Exception as exc:
-        log.exception(
-            "broker_worker.error",
-            extra={"instance": instance, "error": repr(exc)},
-        )
+        log.exception("broker_worker.error", extra={"instance": instance, "error": repr(exc)})
     finally:
-        log.info(
-            "broker_worker.stop",
-            extra={"instance": instance},
-        )
+        log.info("broker_worker.stop", extra={"instance": instance})
 
 
 def _install_signal_handlers(loop: asyncio.AbstractEventLoop, stop_event: asyncio.Event) -> None:
-    """
-    Try to install SIGINT/SIGTERM handlers on platforms that support it.
-
-    On Windows with ProactorEventLoop this will raise NotImplementedError,
-    in which case we just log and rely on KeyboardInterrupt (Ctrl+C).
-    """
     try:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, stop_event.set)
         log.debug("broker_worker.signals.installed")
     except (NotImplementedError, RuntimeError):
-        # Not available on this platform / event loop
         log.debug("broker_worker.signals.unavailable")
 
 
@@ -316,9 +341,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="trader.broker_worker", add_help=True)
     p.add_argument(
         "--instance",
-        default=os.getenv("REFLEX__INSTANCE")
-        or os.getenv("INSTANCE")
-        or get_instance_id(),
+        default=os.getenv("REFLEX__INSTANCE") or os.getenv("INSTANCE") or get_instance_id(),
         help="logical instance id for logging/metrics",
     )
     return p.parse_args(argv)
@@ -328,31 +351,26 @@ def _main() -> int:
     args = _parse_args(sys.argv[1:])
     instance = str(args.instance)
 
-    # Log some environment breadcrumbs (do NOT invent new names)
     log.info(
         "broker_worker.bootstrap",
         extra={
             "instance": instance,
             "redis_url": get_redis_url(),
             "trader_base": _trader_base_url(),
+            "intent_path": _intent_endpoint_path(),
             "python": sys.version.split()[0],
             "platform": platform.platform(),
         },
     )
 
-    # Windows-safe asyncio entrypoint: rely on KeyboardInterrupt rather than signals
     try:
         asyncio.run(_runner(instance))
         return 0
     except KeyboardInterrupt:
-        # Graceful shutdown from console Ctrl+C on Windows
         log.info("broker_worker.keyboard_interrupt", extra={"instance": instance})
         return 0
     except Exception as exc:
-        log.exception(
-            "broker_worker.crashed",
-            extra={"instance": instance, "error": repr(exc)},
-        )
+        log.exception("broker_worker.crashed", extra={"instance": instance, "error": repr(exc)})
         return 1
 
 

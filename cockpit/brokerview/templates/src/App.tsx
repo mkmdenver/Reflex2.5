@@ -201,6 +201,8 @@ interface Position {
   qty: number;
   avg_price: number | null;
   market_price: number | null;
+  stop_price?: number | null;
+  target_price?: number | null;
   unrealized_pl: number | null;
   side?: string | null;
   account_id?: string | null;
@@ -615,7 +617,8 @@ export default function App() {
 
 
     // Fast truth path: Trader events (proxied by BrokerView).
-    const es = new EventSource("/v1/events");
+    const es = new EventSource("/events");
+
 
 
     // Refresh orders immediately when local UI submits an order
@@ -807,12 +810,37 @@ export default function App() {
   };
 
   const handleFlattenAll = async () => {
-    alert("TODO: wire /v1/portfolio/flatten or equivalent in Trader.");
+    try {
+      const res = await fetch("/v1/accounts/flatten", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ account_id: selectedAccount }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      await res.json();
+      // refresh
+      window.dispatchEvent(new Event("reflex:orders_refresh"));
+    } catch (e: any) {
+      alert(`Flatten failed: ${e?.message || String(e)}`);
+    }
   };
 
   const handleCancelAllOrders = async () => {
-    alert("TODO: wire /v1/orders/cancel_all or equivalent in Trader.");
+    try {
+      const res = await fetch("/v1/accounts/cancel_all", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ account_id: selectedAccount }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      await res.json();
+      // refresh
+      window.dispatchEvent(new Event("reflex:orders_refresh"));
+    } catch (e: any) {
+      alert(`Cancel-all failed: ${e?.message || String(e)}`);
+    }
   };
+
 
   const renderSessionPill = () => (
     <span style={{ ...pill, borderColor: sessionColor, color: sessionColor }}>
@@ -926,6 +954,8 @@ export default function App() {
               <th style={thStyle}>Side</th>
               <th style={thStyle}>Qty</th>
               <th style={thStyle}>Avg Price</th>
+              <th style={thStyle}>Stop</th>
+              <th style={thStyle}>Target</th>
               <th style={thStyle}>Mkt Price</th>
               <th style={thStyle}>Unrealized P&amp;L</th>
               <th style={thStyle}>Account</th>
@@ -938,9 +968,7 @@ export default function App() {
                 <td style={tdStyle}>
                   <span
                     style={badge(
-                      (p.side ?? "").toLowerCase() === "short"
-                        ? "#fb7185"
-                        : "#22c55e"
+                      (p.side ?? "").toLowerCase() === "short" ? "#fb7185" : "#22c55e"
                     )}
                   >
                     {(p.side ?? "long").toUpperCase()}
@@ -948,15 +976,11 @@ export default function App() {
                 </td>
                 <td style={tdStyle}>{formatNumber(p.qty, 0)}</td>
                 <td style={tdStyle}>{formatCurrency(p.avg_price)}</td>
+                <td style={tdStyle}>{p.stop_price != null ? formatCurrency(p.stop_price) : "-"}</td>
+                <td style={tdStyle}>{p.target_price != null ? formatCurrency(p.target_price) : "-"}</td>
                 <td style={tdStyle}>{formatCurrency(p.market_price)}</td>
                 <td style={tdStyle}>
-                  <span
-                    style={badge(
-                      (p.unrealized_pl ?? 0) >= 0
-                        ? "#22c55e"
-                        : "#f97316"
-                    )}
-                  >
+                  <span style={badge((p.unrealized_pl ?? 0) >= 0 ? "#22c55e" : "#f97316")}>
                     {formatCurrency(p.unrealized_pl)}
                   </span>
                 </td>
@@ -964,6 +988,7 @@ export default function App() {
               </tr>
             ))}
           </tbody>
+
         </table>
       </div>
     );

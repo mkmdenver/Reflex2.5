@@ -1,10 +1,10 @@
 # trader/adapters/alpaca_adapter.py
-# v1.4 — normalize open orders so local echo merges correctly
+# v1.5 — include position market fields (current_price/unrealized_pl/etc) in snapshots
 #
-# ONLY CHANGE vs your v1.3:
-#   - list_open_orders() now normalizes orders via self._normalize_order(...)
-#
-# No other logic altered.
+# v1.5 changes:
+#   - refresh_snapshot() now maps Alpaca /v2/positions fields into Position:
+#       market_price, market_value, unrealized_pl, unrealized_plpc, side
+#   - No other behavior changed.
 
 from __future__ import annotations
 import logging
@@ -89,15 +89,21 @@ class AlpacaAdapter:
     def _has_creds(self) -> bool:
         return bool(self.base and self.key_id and self.secret)
 
+    def _f(self, x: Any, default: float = 0.0) -> float:
+        try:
+            if x is None:
+                return float(default)
+            return float(x)
+        except Exception:
+            return float(default)
+
     # ------------------------------------------------------------------ #
     # Snapshot
     # ------------------------------------------------------------------ #
 
     def refresh_snapshot(self) -> AccountSnapshot:
         if not self._has_creds():
-            log.warning(
-                "alpaca.refresh_snapshot: missing creds for %r", self.account_id
-            )
+            log.warning("alpaca.refresh_snapshot: missing creds for %r", self.account_id)
             return AccountSnapshot(self.account_id, 0.0, 0.0, 0.0, [])
 
         cash = equity = buying_power = 0.0
@@ -108,19 +114,27 @@ class AlpacaAdapter:
                 acc = client.get(f"{self.base}/v2/account", headers=self._headers())
                 acc.raise_for_status()
                 adata = acc.json()
-                cash = float(adata.get("cash", 0) or 0.0)
-                equity = float(adata.get("equity", 0) or 0.0)
-                buying_power = float(adata.get("buying_power", 0) or 0.0)
+                cash = self._f(adata.get("cash", 0))
+                equity = self._f(adata.get("equity", 0))
+                buying_power = self._f(adata.get("buying_power", 0))
 
                 pos = client.get(f"{self.base}/v2/positions", headers=self._headers())
                 if pos.status_code == 200:
-                    for p in pos.json():
+                    for p in pos.json() or []:
                         try:
+                            # Alpaca position payload includes:
+                            # symbol, qty, avg_entry_price, current_price, market_value,
+                            # unrealized_pl, unrealized_plpc, side, etc.
                             positions.append(
                                 Position(
-                                    symbol=p.get("symbol", ""),
-                                    qty=float(p.get("qty", 0) or 0.0),
-                                    avg_price=float(p.get("avg_entry_price", 0) or 0.0),
+                                    symbol=(p.get("symbol") or "").upper(),
+                                    qty=self._f(p.get("qty", 0)),
+                                    avg_price=self._f(p.get("avg_entry_price", 0)),
+                                    market_price=self._f(p.get("current_price", 0)),
+                                    market_value=self._f(p.get("market_value", 0)),
+                                    unrealized_pl=self._f(p.get("unrealized_pl", 0)),
+                                    unrealized_plpc=self._f(p.get("unrealized_plpc", 0)),
+                                    side=(p.get("side") or None),
                                 )
                             )
                         except Exception:
@@ -150,9 +164,7 @@ class AlpacaAdapter:
         client_order_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         if not self._has_creds():
-            raise RuntimeError(
-                f"alpaca.place_order: missing creds for {self.account_id}"
-            )
+            raise RuntimeError(f"alpaca.place_order: missing creds for {self.account_id}")
 
         sym = (symbol or "").upper()
         s_side = (side or "").lower()
@@ -244,7 +256,6 @@ class AlpacaAdapter:
                 data = r.json()
                 if not isinstance(data, list):
                     return []
-                # ✅ FIX: normalize open orders too (so client_order_id is present)
                 out: List[Dict[str, Any]] = []
                 for o in data:
                     out.append(self._normalize_order(o))
@@ -262,11 +273,7 @@ class AlpacaAdapter:
                 resp = client.get(
                     f"{self.base}/v2/orders",
                     headers=self._headers(),
-                    params={
-                        "status": "closed",
-                        "limit": int(limit),
-                        "direction": "desc",
-                    },
+                    params={"status": "closed", "limit": int(limit), "direction": "desc"},
                 )
                 if resp.status_code != 200:
                     log.warning("alpaca.list_closed_orders HTTP error %s", resp.text)
@@ -288,9 +295,7 @@ class AlpacaAdapter:
 
     def cancel_order(self, order_id: str) -> Dict[str, Any]:
         if not self._has_creds():
-            raise RuntimeError(
-                f"alpaca.cancel_order: missing creds for {self.account_id}"
-            )
+            raise RuntimeError(f"alpaca.cancel_order: missing creds for {self.account_id}")
 
         url = f"{self.base}/v2/orders/{order_id}"
         with httpx.Client(timeout=15.0) as client:

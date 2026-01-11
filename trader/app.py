@@ -37,6 +37,9 @@ from .trade_runner import TradeRunner
 log = logging.getLogger("trader.app")
 app = FastAPI(title="Reflex Trader API", version="2.1.0")
 
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 # ---------------------------------------------------------------------------
 # Global portfolio manager instance
 # ---------------------------------------------------------------------------
@@ -415,6 +418,118 @@ def _default_account_id() -> Optional[str]:
 # Coercion helpers
 # ---------------------------------------------------------------------------
 
+def _as_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        if isinstance(x, bool):
+            return None
+        if isinstance(x, (int, float)):
+            return float(x)
+        s = str(x).strip()
+        if not s:
+            return None
+        return float(s)
+    except Exception:
+        return None
+
+def _best_stop_and_target_for_position(aid: str, sym: str, side: str, mkt_price: float) -> tuple[Optional[float], Optional[float]]:
+    """
+    Infer stop/target from cached local orders (_LOCAL_ORDERS) and/or managed trades (_MANAGED_TRADES).
+    Cache-only: never calls broker.
+    """
+    s = (sym or "").upper().strip()
+    side_lc = (side or "").lower().strip()
+    if side_lc not in ("long", "short"):
+        side_lc = "long"
+
+    # For long positions: stop is SELL stop below market, target is SELL limit above market.
+    # For short positions: stop is BUY stop above market, target is BUY limit below market.
+    want_side = "sell" if side_lc == "long" else "buy"
+
+    best_stop: Optional[float] = None
+    best_tgt: Optional[float] = None
+
+    # 1) Scan local order ledger (cached)
+    try:
+        for o in (_LOCAL_ORDERS or {}).values():
+            if (o.get("account_id") or "") != aid:
+                continue
+            if str(o.get("symbol") or "").upper().strip() != s:
+                continue
+            if not _is_active_status(o.get("status")):
+                continue
+
+            o_side = str(o.get("side") or "").lower().strip()
+            o_type = str(o.get("type") or "").lower().strip()
+
+            # Protective STOP-like orders
+            if o_side == want_side and o_type in ("stop", "stop_limit", "trailing", "trailing_stop"):
+                sp = _as_float(o.get("stop_price"))
+                if sp and sp > 0:
+                    if side_lc == "long":
+                        # stop should be <= market; choose highest (tightest)
+                        if mkt_price > 0 and sp > mkt_price:
+                            continue
+                        if best_stop is None or sp > best_stop:
+                            best_stop = sp
+                    else:
+                        # short stop should be >= market; choose lowest (tightest)
+                        if mkt_price > 0 and sp < mkt_price:
+                            continue
+                        if best_stop is None or sp < best_stop:
+                            best_stop = sp
+
+            # Target TAKE-PROFIT-like (limit order)
+            if o_side == want_side and o_type == "limit":
+                lp = _as_float(o.get("limit_price"))
+                if lp and lp > 0:
+                    if side_lc == "long":
+                        # target should be >= market; choose lowest above
+                        if mkt_price > 0 and lp < mkt_price:
+                            continue
+                        if best_tgt is None or lp < best_tgt:
+                            best_tgt = lp
+                    else:
+                        # short target should be <= market; choose highest below
+                        if mkt_price > 0 and lp > mkt_price:
+                            continue
+                        if best_tgt is None or lp > best_tgt:
+                            best_tgt = lp
+    except Exception:
+        pass
+
+    # 2) Fallback to managed trade dict (if present)
+    try:
+        for t in (_MANAGED_TRADES or {}).values():
+            if (t.get("account_id") or "") != aid:
+                continue
+            if str(t.get("symbol") or "").upper().strip() != s:
+                continue
+            st = str(t.get("state") or "")
+            if st in ("DONE", "CANCELED", "ERROR", "ABORT_PROTECTION", "REJECTED"):
+                continue
+
+            if best_stop is None:
+                sp = _as_float(t.get("stop_price"))
+                if sp and sp > 0:
+                    best_stop = sp
+
+            if best_tgt is None:
+                tp = _as_float(t.get("take_profit_price"))
+                if not tp:
+                    plan = t.get("plan")
+                    if isinstance(plan, dict):
+                        ex = plan.get("exit")
+                        if isinstance(ex, dict):
+                            tp = _as_float(ex.get("target_price"))
+                if tp and tp > 0:
+                    best_tgt = tp
+    except Exception:
+        pass
+
+    return best_stop, best_tgt
+
 def _coerce_positions(raw_positions: List[Any], account_id: str) -> List[Dict[str, Any]]:
     norm: List[Dict[str, Any]] = []
     for p in raw_positions or []:
@@ -431,15 +546,45 @@ def _coerce_positions(raw_positions: List[Any], account_id: str) -> List[Dict[st
         mkt_price = d.get("market_price", d.get("current_price", d.get("last_price", 0) or 0))
         side = d.get("side") or ("long" if float(qty) >= 0 else "short")
 
+        fqty = float(qty or 0.0)
+        favg = float(avg_price or 0.0)
+        fmkt = float(mkt_price or 0.0)
+
+        # Compute unrealized P/L cache-only (truthy even if broker omits fields)
+        if fqty >= 0:
+            # long
+            upl = (fmkt - favg) * fqty
+        else:
+            # short (qty negative)
+            upl = (favg - fmkt) * abs(fqty)
+
+        # % based on cost basis
+        cost_basis = abs(fqty) * favg
+        uplpc = (upl / cost_basis * 100.0) if cost_basis > 0 else 0.0
+        mkt_value = abs(fqty) * fmkt
+
+        stop_price, target_price = _best_stop_and_target_for_position(
+            account_id,
+            str(sym or ""),
+            str(side or ""),
+            fmkt,
+        )
+
         norm.append({
             "account_id": account_id,
             "symbol": sym,
-            "qty": float(qty),
-            "avg_price": float(avg_price or 0),
-            "market_price": float(mkt_price or 0),
+            "qty": fqty,
+            "avg_price": favg,
+            "market_price": fmkt,
+            "market_value": mkt_value,
+            "unrealized_pl": upl,
+            "unrealized_plpc": uplpc,
             "side": side,
+            "stop_price": stop_price,
+            "target_price": target_price,
         })
     return norm
+
 
 def _coerce_order_dict(o: Any, account_id: str) -> Dict[str, Any]:
     if hasattr(o, "to_dict"):
@@ -1032,6 +1177,7 @@ async def api_accounts_cancel_all(request: Request):
 
 @app.get("/v1/intents")
 async def api_list_intents(limit: int = Query(50, alias="limit")):
+    print("Listing intents with limit:", limit)
     _journal_sync_if_needed()
     try:
         n = max(1, min(int(limit or 50), 500))
@@ -1075,6 +1221,7 @@ async def api_submit_intent(request: Request):
     trade_id = _new_trade_id()
     now = time.time()
 
+    print(f"Submitting intent {intent_id} for trade {trade_id} on account {account_id} for symbol {symbol} with side {side}")
     intent_doc: Dict[str, Any] = {
         "intent_id": intent_id,
         "trade_id": trade_id,

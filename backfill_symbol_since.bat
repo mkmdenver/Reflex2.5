@@ -14,7 +14,7 @@ REM   backfill_symbol_since SPY tick   2025-08-01
 REM ============================================================
 
 if "%~3"=="" (
-  echo Usage: backfill_symbol_since SYMBOL KIND YYYY-MM-DD
+  echo Usage: %~nx0 SYMBOL KIND YYYY-MM-DD
   exit /b 1
 )
 
@@ -22,62 +22,27 @@ set "SYMBOL=%~1"
 set "KIND=%~2"
 set "SINCE=%~3"
 
-REM ------------------------------------------------------------
-REM Resolve repo root
-REM ------------------------------------------------------------
-set "REPO_ROOT=%~dp0"
-cd /d "%REPO_ROOT%"
+set "ROOT=%~dp0"
+if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 
-echo [PATH] REPO_ROOT = %REPO_ROOT%
+cd /d "%ROOT%"
+call "%ROOT%\env.bat"
 
-REM ------------------------------------------------------------
-REM Load .env
-REM ------------------------------------------------------------
-if exist ".env" (
-  echo [ENV] Loading .env ...
-  for /F "usebackq tokens=1,* delims==" %%A in (".env") do (
-    set "line=%%A"
-    if not "!line!"=="" if "!line:~0,1!" NEQ "#" (
-      set "%%A=%%B"
-    )
-  )
-) else (
-  echo [WARN] .env not found
-)
+set "PY=%ROOT%\.venv\Scripts\python.exe"
+if not exist "%PY%" set "PY=%ROOT%.venv\Scripts\python.exe"
+if not exist "%PY%" set "PY=python"
 
-REM ------------------------------------------------------------
-REM Ensure venv + requirements
-REM ------------------------------------------------------------
-set "VENV_DIR=%REPO_ROOT%\.venv"
-set "PY=%VENV_DIR%\Scripts\python.exe"
+set "MODULE=tools.symbol_manager.db_backfill"
 
-if not exist "%PY%" (
-  echo [VENV] Creating virtualenv at %VENV_DIR% ...
-  python -m venv "%VENV_DIR%"
-)
-
-echo [VENV] Using %PY%
-
-if exist "requirements.txt" (
-  echo [VENV] Installing requirements...
-  "%PY%" -m pip install -r requirements.txt
-)
-
-REM ------------------------------------------------------------
-REM Run backfill
-REM ------------------------------------------------------------
-echo.
 echo [RUN] %KIND% backfill %SYMBOL% since %SINCE%
+"%PY%" -m %MODULE% --kind %KIND% --symbol %SYMBOL% --since %SINCE%
+set "RC=%errorlevel%"
 
-"%PY%" -m tools.symbol_manager.db_backfill ^
-  --kind %KIND% ^
-  --symbol %SYMBOL% ^
-  --since %SINCE%
-
-if errorlevel 1 (
-  echo [ERROR] Backfill failed.
-  exit /b 1
+if not "%RC%"=="0" (
+  echo [ERROR] Backfill failed with exit code %RC%
+  endlocal & exit /b %RC%
 )
 
 echo [DONE] Backfill complete.
+endlocal
 exit /b 0
