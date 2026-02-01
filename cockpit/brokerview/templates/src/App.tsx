@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { OrderEntry } from "./components/orderentry";
 
 type Json = any;
@@ -206,6 +206,11 @@ interface Position {
   unrealized_pl: number | null;
   side?: string | null;
   account_id?: string | null;
+
+  // Optional (not always provided by Trader). BrokerView will also maintain a local
+  // first-seen timestamp so we can produce a stable "entered" sort under load.
+  opened_at?: string | null;
+  entered_at?: string | null;
 }
 
 interface Order {
@@ -273,6 +278,20 @@ interface PositionsResponse {
 interface AccountsResponse {
   accounts: AccountSummary[];
 }
+
+type ExitTag = "stop" | "target";
+
+type ClosedPositionRow = {
+  account_id?: string | null;
+  symbol: string;
+  side: "LONG" | "SHORT";
+  qty: number;
+  entry_price: number | null;
+  exit_price: number | null;
+  pnl: number | null;
+  exit_ts: string | null;
+  exit_reason: ExitTag | "manual" | "unknown";
+};
 
 const API_BASE = "";
 
@@ -409,6 +428,12 @@ const dangerButton: React.CSSProperties = {
   cursor: "pointer",
 };
 
+const tinyDangerButton: React.CSSProperties = {
+  ...dangerButton,
+  fontSize: 11,
+  padding: "4px 8px",
+};
+
 const primaryButton: React.CSSProperties = {
   fontSize: 13,
   padding: "7px 14px",
@@ -488,6 +513,20 @@ export default function App() {
     loading: true,
     error: null,
   });
+
+  // -------------------------------------------------------------------------
+  // UI-side stability: remember when we first saw each open position so we can
+  // sort by "entered" even if the backend snapshot lacks timestamps.
+  // Key is account_id:symbol (one live position per symbol per account).
+  // -------------------------------------------------------------------------
+  const positionFirstSeenRef = useRef<Map<string, number>>(new Map());
+
+  type PositionSort = "entered" | "symbol" | "pnl";
+  const [positionSort, setPositionSort] = useState<PositionSort>("entered");
+
+  type OrdersSort = "time" | "symbol" | "status";
+  const [activeOrdersSort, setActiveOrdersSort] = useState<OrdersSort>("time");
+  const [closedOrdersSort, setClosedOrdersSort] = useState<OrdersSort>("time");
 
   const [activeOrders, setActiveOrders] = useState<Order[]>([]);
   const [closedOrders, setClosedOrders] = useState<Order[]>([]);
@@ -574,11 +613,24 @@ export default function App() {
     const loadPositions = async () => {
       try {
         setPositionsLoad((s) => ({ ...s, loading: true, error: null }));
-        logApi("GET /v1/positions");
-        const data = await fetchJson<PositionsResponse>("/v1/positions");
+        logApi(`GET /v1/positions?account=${encodeURIComponent(selectedAccount)}`);
+        const data = await fetchJson<PositionsResponse>(`/v1/positions?account=${encodeURIComponent(selectedAccount)}`);
         if (cancelled) return;
         setLastRawPositions(data);
-        setPositions(data.positions ?? []);
+        const items = (data.positions ?? []) as Position[];
+
+        // Maintain a local "first-seen" timestamp per position identity so the UI can
+        // keep a stable, deterministic sort even when the backend doesn't provide an
+        // explicit entry timestamp.
+        const now = Date.now();
+        for (const p of items) {
+          const key = `${p.account_id || ""}:${(p.symbol || "").toUpperCase()}`;
+          if (!positionFirstSeenRef.current.has(key)) {
+            positionFirstSeenRef.current.set(key, now);
+          }
+        }
+
+        setPositions(items);
         setPositionsLoad({ loading: false, error: null });
       } catch (err: any) {
         if (cancelled) return;
@@ -594,12 +646,12 @@ export default function App() {
         setOrdersLoad((s) => ({ ...s, loading: true, error: null }));
         logApi("GET /v1/orders?status=active");
         const active = await fetchJson<OrdersResponse>(
-          "/v1/orders?status=active"
+          `/v1/orders?status=active&account=${encodeURIComponent(selectedAccount)}`
         );
         if (cancelled) return;
         logApi("GET /v1/orders?status=closed");
         const closed = await fetchJson<OrdersResponse>(
-          "/v1/orders?status=closed"
+          `/v1/orders?status=closed&account=${encodeURIComponent(selectedAccount)}`
         );
         if (cancelled) return;
         setLastRawOrders({ active, closed });
@@ -670,6 +722,160 @@ export default function App() {
     }
     return s;
   }, [closedOrders]);
+
+  const exitBySymbol = useMemo(() => {
+    const m = new Map<string, { tag: ExitTag; limit_price: number | null; status: string | null; client_order_id: string | null }>();
+    for (const o of activeOrders) {
+      const cid = (o.client_order_id || "").toString();
+      if (!cid.includes(":exit:")) continue;
+      const sym = (o.symbol || "").toString().toUpperCase();
+      if (!sym) continue;
+      const tag: ExitTag | null = cid.includes(":exit:stop") ? "stop" : cid.includes(":exit:target") ? "target" : null;
+      if (!tag) continue;
+      m.set(sym, {
+        tag,
+        limit_price: o.limit_price != null ? Number(o.limit_price) : null,
+        status: o.status ? String(o.status) : null,
+        client_order_id: cid || null,
+      });
+    }
+    return m;
+  }, [activeOrders]);
+
+  const closedPositions = useMemo((): ClosedPositionRow[] => {
+    // Derived view for live testing.
+    // A symbol is "closed" if it has a filled closing order and is not currently in open positions.
+    // We prefer Reflex-tagged exits (client_order_id contains :exit:stop/:exit:target) to classify reason.
+    // Entry/Exit prices come from filled_avg_price when available.
+
+    // IMPORTANT: treat qty==0 as NOT open. Some backends keep "positions" rows around at 0,
+    // which would otherwise suppress closed-position rendering.
+    const openSyms = new Set(
+      (positions || [])
+        .filter((p: any) => {
+          const sym = (p?.symbol || "").toString().toUpperCase();
+          if (!sym) return false;
+          const qRaw = (p as any).qty ?? (p as any).quantity ?? (p as any).position_qty;
+          const q = Number(qRaw);
+          return Number.isFinite(q) && Math.abs(q) > 1e-9;
+        })
+        .map((p: any) => (p.symbol || "").toString().toUpperCase())
+    );
+
+    // Group closed orders by symbol
+    const bySym = new Map<string, Order[]>();
+    for (const o of closedOrders) {
+      const sym = (o.symbol || "").toString().toUpperCase();
+      if (!sym) continue;
+      if (!bySym.has(sym)) bySym.set(sym, []);
+      bySym.get(sym)!.push(o);
+    }
+
+    // Helper: stable-ish sort by submitted_at/updated_at/created_at
+    const ordTs = (o: Order): string => (o.submitted_at || o.updated_at || o.created_at || "") as string;
+
+    // Helper: best effort numeric fill price
+    const fillPx = (o: Order): number | null => {
+      const v = (o as any).filled_avg_price;
+      if (v != null && v !== "") {
+        const n = Number(v);
+        if (Number.isFinite(n)) return n;
+      }
+      if (o.limit_price != null) {
+        const n = Number(o.limit_price);
+        if (Number.isFinite(n)) return n;
+      }
+      return null;
+    };
+
+    // Helper: base id prefix for entry/exit pairing
+    const baseId = (cid: string | null | undefined): string => {
+      const s = (cid || "").toString();
+      if (!s) return "";
+      return s.split(":")[0] || "";
+    };
+
+    const out: ClosedPositionRow[] = [];
+
+    for (const [sym, orders] of bySym.entries()) {
+      if (openSyms.has(sym)) continue;
+
+      const filled = orders.filter((o) => (o.status || "").toLowerCase() === "filled");
+      if (!filled.length) continue;
+
+      // Prefer a Reflex-tagged filled exit (stop/target). If none, fall back to last filled closing order.
+      const filledTaggedExit = filled
+        .filter((o) => (o.client_order_id || "").toString().includes(":exit:"))
+        .slice()
+        .sort((a, b) => ordTs(b).localeCompare(ordTs(a)))[0];
+
+      const filledSells = filled.filter((o) => (o.side || "").toLowerCase() === "sell");
+      const lastFilledSell = filledSells.slice().sort((a, b) => ordTs(b).localeCompare(ordTs(a)))[0];
+
+      // Choose exit order:
+      // - if we have tagged exit, use it (best for reason)
+      // - else use last filled sell
+      const exit = filledTaggedExit || lastFilledSell;
+      if (!exit) continue;
+
+      // Find entry:
+      // 1) If exit has a base prefix, look for matching :entry
+      // 2) Else, take last filled buy before the exit time
+      const exitBase = baseId(exit.client_order_id);
+      const filledEntries = filled.filter((o) => (o.client_order_id || "").toString().includes(":entry"));
+      let entry = exitBase
+        ? filledEntries.find((o) => baseId(o.client_order_id) === exitBase)
+        : undefined;
+
+      if (!entry) {
+        const exitTime = ordTs(exit);
+        const filledBuys = filled.filter((o) => (o.side || "").toLowerCase() === "buy");
+        entry = filledBuys
+          .filter((o) => ordTs(o) <= exitTime)
+          .slice()
+          .sort((a, b) => ordTs(b).localeCompare(ordTs(a)))[0];
+      }
+
+      const qty = exit.filled_qty != null ? Number(exit.filled_qty) : exit.qty != null ? Number(exit.qty) : 0;
+      // Entry price: best effort
+      // 1) matching filled entry order (preferred)
+      // 2) some brokers/servers may attach avg_entry/entry_price on the closing order payload
+      const entryPxFromEntry = entry ? fillPx(entry) : null;
+      const entryAltRaw = (exit as any).avg_entry_price ?? (exit as any).entry_price ?? (exit as any).avg_entry ?? null;
+      const entryAlt = entryAltRaw != null && entryAltRaw !== "" ? Number(entryAltRaw) : NaN;
+      const entryPx = entryPxFromEntry != null ? entryPxFromEntry : Number.isFinite(entryAlt) ? entryAlt : null;
+      const exitPx = fillPx(exit);
+      const exitTs = (exit.submitted_at || exit.updated_at || exit.created_at) ?? null;
+
+      // Realized P/L (best-effort). LONG: (exit-entry)*qty. SHORT: (entry-exit)*qty
+      let pnl: number | null = null;
+      if (entryPx != null && exitPx != null && Number.isFinite(entryPx) && Number.isFinite(exitPx) && Number.isFinite(qty)) {
+        const sideGuess: "LONG" | "SHORT" = (exit.side || "").toLowerCase() === "buy" ? "SHORT" : "LONG";
+        pnl = sideGuess === "SHORT" ? (entryPx - exitPx) * qty : (exitPx - entryPx) * qty;
+      }
+
+      let reason: ClosedPositionRow["exit_reason"] = "unknown";
+      const cid = (exit.client_order_id || "").toString();
+      if (cid.includes(":exit:stop")) reason = "stop";
+      else if (cid.includes(":exit:target")) reason = "target";
+      else if (cid) reason = "manual";
+
+      out.push({
+        account_id: (exit as any).account_id ?? null,
+        symbol: sym,
+        side: "LONG",
+        qty,
+        entry_price: entryPx,
+        exit_price: exitPx,
+        pnl,
+        exit_ts: exitTs,
+        exit_reason: reason,
+      });
+    }
+
+    out.sort((a, b) => (b.exit_ts || "").localeCompare(a.exit_ts || ""));
+    return out;
+  }, [closedOrders, positions]);
 
 
 
@@ -796,11 +1002,11 @@ export default function App() {
 
       try {
         const refreshed = await fetchJson<OrdersResponse>(
-          "/v1/orders?status=active"
+          `/v1/orders?status=active&account=${encodeURIComponent(selectedAccount)}`
         );
         setActiveOrders(refreshed.orders ?? []);
       } catch {
-        /* ignore */
+        // ignore refresh errors
       }
     } catch (err: any) {
       setSubmitError(err?.message || String(err));
@@ -838,6 +1044,21 @@ export default function App() {
       window.dispatchEvent(new Event("reflex:orders_refresh"));
     } catch (e: any) {
       alert(`Cancel-all failed: ${e?.message || String(e)}`);
+    }
+  };
+
+  const handleFlattenSymbol = async (symbol: string) => {
+    try {
+      const res = await fetch("/v1/positions/flatten", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ account_id: selectedAccount, symbol }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      await res.json();
+      window.dispatchEvent(new Event("reflex:orders_refresh"));
+    } catch (e: any) {
+      alert(`Flatten ${symbol} failed: ${e?.message || String(e)}`);
     }
   };
 
@@ -926,11 +1147,18 @@ export default function App() {
   };
 
   const renderPositions = () => {
+    // Keep the panel height stable (avoid collapse/flash when empty)
+    const panel = (content: React.ReactNode) => (
+      <div style={{ height: 300, overflowY: "auto", overflowX: "hidden", marginTop: 6 }}>
+        {content}
+      </div>
+    );
+
     if (positionsLoad.loading && positions.length === 0) {
-      return <div style={smallText}>Loading positions…</div>;
+      return panel(<div style={smallText}>Loading positions…</div>);
     }
     if (positionsLoad.error) {
-      return (
+      return panel(
         <div style={{ ...smallText, color: "#fecaca" }}>
           Positions error: {positionsLoad.error}
         </div>
@@ -941,13 +1169,40 @@ export default function App() {
       (p) => !selectedAccount || p.account_id === selectedAccount
     );
 
+    const posEnteredMs = (p: Position): number => {
+      const iso = p.entered_at || p.opened_at || null;
+      if (iso) {
+        const d = new Date(iso);
+        if (!Number.isNaN(d.getTime())) return d.getTime();
+      }
+      const key = `${p.account_id || ""}:${(p.symbol || "").toUpperCase()}`;
+      return positionFirstSeenRef.current.get(key) ?? 0;
+    };
+
+    const sorted = [...filtered].sort((a, b) => {
+      if (positionSort === "symbol") {
+        return (a.symbol || "").localeCompare(b.symbol || "");
+      }
+      if (positionSort === "pnl") {
+        const ap = Number(a.unrealized_pl ?? 0);
+        const bp = Number(b.unrealized_pl ?? 0);
+        // Highest P&L first
+        if (bp !== ap) return bp - ap;
+        return (a.symbol || "").localeCompare(b.symbol || "");
+      }
+      // Default: entered time (most recent first)
+      const at = posEnteredMs(a);
+      const bt = posEnteredMs(b);
+      if (bt !== at) return bt - at;
+      return (a.symbol || "").localeCompare(b.symbol || "");
+    });
+
     if (!filtered.length) {
-      return <div style={smallText}>No open positions.</div>;
+      return panel(<div style={smallText}>No open positions.</div>);
     }
 
-    return (
-      <div style={{ maxHeight: 260, overflow: "auto", marginTop: 6 }}>
-        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+    return panel(
+      <table style={{ width: "100%", borderCollapse: "collapse", tableLayout: "fixed" }}>
           <thead>
             <tr style={{ borderBottom: "1px solid #111827" }}>
               <th style={thStyle}>Symbol</th>
@@ -958,12 +1213,12 @@ export default function App() {
               <th style={thStyle}>Target</th>
               <th style={thStyle}>Mkt Price</th>
               <th style={thStyle}>Unrealized P&amp;L</th>
-              <th style={thStyle}>Account</th>
+              <th style={thStyle}>Actions</th>
             </tr>
           </thead>
           <tbody>
-            {filtered.map((p) => (
-              <tr key={`${p.account_id}:${p.symbol}`}>
+            {sorted.map((p) => (
+              <tr key={`${p.account_id || ""}:${(p.symbol || "").toUpperCase()}`}>
                 <td style={tdStyle}>{p.symbol}</td>
                 <td style={tdStyle}>
                   <span
@@ -976,32 +1231,170 @@ export default function App() {
                 </td>
                 <td style={tdStyle}>{formatNumber(p.qty, 0)}</td>
                 <td style={tdStyle}>{formatCurrency(p.avg_price)}</td>
-                <td style={tdStyle}>{p.stop_price != null ? formatCurrency(p.stop_price) : "-"}</td>
-                <td style={tdStyle}>{p.target_price != null ? formatCurrency(p.target_price) : "-"}</td>
+                <td
+                  style={{
+                    ...tdStyle,
+                    ...(exitBySymbol.get((p.symbol || "").toUpperCase())?.tag === "stop"
+                      ? {
+                          outline: "1px solid #f97316",
+                          outlineOffset: -1,
+                        }
+                      : null),
+                  }}
+                  title={(() => {
+                    const ex = exitBySymbol.get((p.symbol || "").toUpperCase());
+                    if (!ex || ex.tag !== "stop") return "";
+                    const lp = ex.limit_price != null ? ` @ ${formatCurrency(ex.limit_price)}` : "";
+                    return `Exit working (STOP${lp})`;
+                  })()}
+                >
+                  {(() => {
+                    const sym = (p.symbol || "").toUpperCase();
+                    const ex = exitBySymbol.get(sym);
+                    const base = p.stop_price != null ? formatCurrency(p.stop_price) : "-";
+                    if (ex && ex.tag === "stop") {
+                      // Keep columns stable: no long text, just a small badge.
+                      return (
+                        <span>
+                          {base}{" "}
+                          <span style={badge("#f97316")}>EXIT</span>
+                        </span>
+                      );
+                    }
+                    return base;
+                  })()}
+                </td>
+                <td
+                  style={{
+                    ...tdStyle,
+                    ...(exitBySymbol.get((p.symbol || "").toUpperCase())?.tag === "target"
+                      ? {
+                          outline: "1px solid #f97316",
+                          outlineOffset: -1,
+                        }
+                      : null),
+                  }}
+                  title={(() => {
+                    const ex = exitBySymbol.get((p.symbol || "").toUpperCase());
+                    if (!ex || ex.tag !== "target") return "";
+                    const lp = ex.limit_price != null ? ` @ ${formatCurrency(ex.limit_price)}` : "";
+                    return `Exit working (TARGET${lp})`;
+                  })()}
+                >
+                  {(() => {
+                    const sym = (p.symbol || "").toUpperCase();
+                    const ex = exitBySymbol.get(sym);
+                    const base = p.target_price != null ? formatCurrency(p.target_price) : "-";
+                    if (ex && ex.tag === "target") {
+                      return (
+                        <span>
+                          {base}{" "}
+                          <span style={badge("#f97316")}>EXIT</span>
+                        </span>
+                      );
+                    }
+                    return base;
+                  })()}
+                </td>
                 <td style={tdStyle}>{formatCurrency(p.market_price)}</td>
                 <td style={tdStyle}>
                   <span style={badge((p.unrealized_pl ?? 0) >= 0 ? "#22c55e" : "#f97316")}>
                     {formatCurrency(p.unrealized_pl)}
                   </span>
                 </td>
-                <td style={tdStyle}>{p.account_id}</td>
+                <td style={tdStyle}>
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    <button
+                      type="button"
+                      style={tinyDangerButton}
+                      onClick={() => handleFlattenSymbol(p.symbol)}
+                      title="Flatten this symbol (market order, best-effort)"
+                    >
+                      Flatten
+                    </button>
+                  </div>
+                </td>
               </tr>
             ))}
           </tbody>
 
-        </table>
-      </div>
+      </table>
     );
   };
 
-  const renderOrdersTable = (orders: Order[]) => {
+  type OrdersTableMode = "active" | "closed";
+
+  function orderTsMs(o: Order, mode: OrdersTableMode): number {
+    const raw: any = (o as any).raw || null;
+
+    // For CLOSED orders, "Executed" must mean filled/executed time, and must NOT be
+    // distorted by later reconciliation updates.
+    const candidates =
+      mode === "closed"
+        ? [
+            raw?.filled_at,
+            raw?.filled_at_utc,
+            raw?.filled_at_iso,
+            (o as any).filled_at,
+            o.submitted_at,
+            o.created_at,
+            // NOTE: updated_at intentionally excluded for closed sort
+          ]
+        : [
+            raw?.filled_at,
+            raw?.filled_at_utc,
+            raw?.filled_at_iso,
+            (o as any).filled_at,
+            o.updated_at,
+            o.submitted_at,
+            o.created_at,
+          ];
+
+    for (const v of candidates.filter(Boolean)) {
+      const t = Date.parse(String(v));
+      if (Number.isFinite(t)) return t;
+    }
+    return 0;
+  }
+
+  const orderFillPrice = (o: Order): number | null => {
+    const raw: any = (o as any).raw || null;
+    const v = o.avg_fill_price ?? raw?.avg_fill_price ?? raw?.filled_avg_price ?? raw?.filled_avg_price_per_share;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+
+  const renderOrdersTable = (orders: Order[], mode: OrdersTableMode) => {
+    // Keep panel height stable (avoid collapse/flash when empty)
+    const panel = (content: React.ReactNode) => (
+      <div style={{ height: 260, overflowY: "auto", overflowX: "hidden", marginTop: 6 }}>
+        {content}
+      </div>
+    );
+
     if (!orders.length) {
-      return <div style={smallText}>No orders.</div>;
+      return panel(<div style={smallText}>No orders.</div>);
     }
 
-    return (
-      <div style={{ maxHeight: 260, overflow: "auto", marginTop: 6 }}>
-        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+    const sortKey = mode === "active" ? activeOrdersSort : closedOrdersSort;
+    const sorted = [...orders].sort((a, b) => {
+      if (sortKey === "symbol") {
+        return (a.symbol || "").localeCompare(b.symbol || "");
+      }
+      if (sortKey === "status") {
+        const as = (a.status || "").localeCompare(b.status || "");
+        if (as !== 0) return as;
+        return (a.symbol || "").localeCompare(b.symbol || "");
+      }
+      // Default: time (most recent first)
+      const at = orderTsMs(a,mode);
+      const bt = orderTsMs(b,mode);
+      if (bt !== at) return bt - at;
+      return (a.symbol || "").localeCompare(b.symbol || "");
+    });
+
+    return panel(
+      <table style={{ width: "100%", borderCollapse: "collapse", tableLayout: "fixed" }}>
           <thead>
             <tr style={{ borderBottom: "1px solid #111827" }}>
               <th style={thStyle}>Time</th>
@@ -1011,14 +1404,31 @@ export default function App() {
               <th style={thStyle}>Type</th>
               <th style={thStyle}>Limit</th>
               <th style={thStyle}>Stop</th>
+              {mode === "closed" && <th style={thStyle}>Fill</th>}
               <th style={thStyle}>Status</th>
             </tr>
           </thead>
           <tbody>
-            {orders.map((o) => (
-              <tr key={o.id}>
+            {sorted.map((o) => (
+              <tr key={orderKey(o)}>
                 <td style={tdStyle} title={o.client_order_id || o.id}>
-                  {fmtTsNY(o.submitted_at || o.updated_at || o.created_at)}
+                  {fmtTsNY(
+                    (() => {
+                      const raw: any = (o as any).raw || null;
+                      if (mode === "closed") {
+                        return (
+                          raw?.filled_at ||
+                          raw?.filled_at_utc ||
+                          raw?.filled_at_iso ||
+                          (o as any).filled_at ||
+                          o.updated_at ||
+                          o.submitted_at ||
+                          o.created_at
+                        );
+                      }
+                      return o.submitted_at || o.updated_at || o.created_at;
+                    })()
+                  )}
                 </td>
                 <td style={tdStyle}>{o.symbol}</td>
                 <td style={tdStyle}>
@@ -1040,6 +1450,11 @@ export default function App() {
                 <td style={tdStyle}>
                   {o.stop_price != null ? formatCurrency(o.stop_price) : "-"}
                 </td>
+                {mode === "closed" && (
+                  <td style={tdStyle}>
+                    {orderFillPrice(o) != null ? formatCurrency(orderFillPrice(o)) : "-"}
+                  </td>
+                )}
                 <td style={tdStyle}>
                   <span
                     style={badge(
@@ -1054,8 +1469,7 @@ export default function App() {
               </tr>
             ))}
           </tbody>
-        </table>
-      </div>
+      </table>
     );
   };
 
@@ -1234,30 +1648,34 @@ export default function App() {
         </div>
       </div>
 
-      <div>
-        <div style={labelStyle}>Execute at (optional)</div>
-        <input
-          style={inputStyle}
-          type="text"
-          value={executeAt}
-          onChange={(e) => setExecuteAt(e.target.value)}
-          placeholder="e.g. 2025-11-13T09:35:00 or leave blank for now"
-        />
-        <div style={smallText}>
-          UI-only for now. Once scheduling is wired into Trader/Sim, this will
-          control deferred execution.
+      <details style={{ marginTop: 10 }}>
+        <summary style={{ ...smallText, cursor: "pointer", userSelect: "none" }}>
+          Advanced (optional)
+        </summary>
+        <div style={{ marginTop: 10 }}>
+          <div style={labelStyle}>Execute at (optional)</div>
+          <input
+            style={inputStyle}
+            type="text"
+            value={executeAt}
+            onChange={(e) => setExecuteAt(e.target.value)}
+            placeholder="e.g. 2025-11-13T09:35:00 or leave blank for now"
+          />
+          <div style={smallText}>
+            UI-only for now.
+          </div>
         </div>
-      </div>
 
-      <div style={{ marginTop: 12 }}>
-        <div style={labelStyle}>Client note</div>
-        <input
-          style={inputStyle}
-          value={clientNote}
-          onChange={(e) => setClientNote(e.target.value)}
-          placeholder="Optional tag/reason for this order"
-        />
-      </div>
+        <div style={{ marginTop: 12 }}>
+          <div style={labelStyle}>Client note</div>
+          <input
+            style={inputStyle}
+            value={clientNote}
+            onChange={(e) => setClientNote(e.target.value)}
+            placeholder="Optional tag/reason for this order"
+          />
+        </div>
+      </details>
 
       {submitError && (
         <div
@@ -1301,52 +1719,46 @@ export default function App() {
         >
           {submitting ? "Sending…" : "Submit order"}
         </button>
-        <div style={{ display: "flex", gap: 8 }}>
-          <button
-            type="button"
-            style={dangerButton}
-            onClick={handleFlattenAll}
-          >
-            Flatten all
-          </button>
-          <button
-            type="button"
-            style={dangerButton}
-            onClick={handleCancelAllOrders}
-          >
-            Cancel all orders
-          </button>
-        </div>
+        <div />
       </div>
     </form>
   );
 
   const renderTradeTab = () => (
     <div style={gridRow}>
-      <div style={card}>
-        <div style={cardHeaderRow}>
-          <div style={cardTitle}>Order entry</div>
-          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            {renderSessionPill()}
-          </div>
-        </div>
-        {renderOrderEntry()}
-      </div>
-
+      {/* LEFT COLUMN: Order entry + orders */}
       <div style={{ display: "grid", gap: 16 }}>
         <div style={card}>
           <div style={cardHeaderRow}>
-            <div style={cardTitle}>Positions</div>
-            <span style={smallText}>
-              Source: Trader /v1/portfolio/positions
-            </span>
+            <div style={cardTitle}>Order entry</div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              {renderSessionPill()}
+            </div>
           </div>
-          {renderPositions()}
+          {renderOrderEntry()}
         </div>
+
         <div style={card}>
           <div style={cardHeaderRow}>
             <div style={cardTitle}>Active orders</div>
-            <span style={smallText}>Polling /v1/orders?status=active</span>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+              <label style={smallText}>
+                Sort
+                <select
+                  style={{ ...selectStyle, width: 140, marginLeft: 8, padding: "4px 8px" }}
+                  value={activeOrdersSort}
+                  onChange={(e) => setActiveOrdersSort(e.target.value as any)}
+                >
+                  <option value="time">Submitted</option>
+                  <option value="symbol">Symbol</option>
+                  <option value="status">Status</option>
+                </select>
+              </label>
+              <span style={smallText}>Polling /v1/orders?status=active</span>
+              <button type="button" style={dangerButton} onClick={handleCancelAllOrders} title="Cancel ALL active orders (account)">
+                Cancel active
+              </button>
+            </div>
           </div>
           {ordersLoad.error ? (
             <div style={{ ...smallText, color: "#fecaca" }}>
@@ -1359,16 +1771,30 @@ export default function App() {
                 .filter((o) => {
                   const k = orderKey(o);
                   return !(k && closedKeys.has(k)) && !(o.id && closedKeys.has(String(o.id)));
-                })
+                }),
+              "active"
             )
           )}
-
         </div>
 
         <div style={card}>
           <div style={cardHeaderRow}>
             <div style={cardTitle}>Closed / canceled / rejected orders</div>
-            <span style={smallText}>Polling /v1/orders?status=closed</span>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+              <label style={smallText}>
+                Sort
+                <select
+                  style={{ ...selectStyle, width: 140, marginLeft: 8, padding: "4px 8px" }}
+                  value={closedOrdersSort}
+                  onChange={(e) => setClosedOrdersSort(e.target.value as any)}
+                >
+                  <option value="time">Executed</option>
+                  <option value="symbol">Symbol</option>
+                  <option value="status">Status</option>
+                </select>
+              </label>
+              <span style={smallText}>Polling /v1/orders?status=closed</span>
+            </div>
           </div>
           {ordersLoad.error ? (
             <div style={{ ...smallText, color: "#fecaca" }}>
@@ -1376,13 +1802,89 @@ export default function App() {
             </div>
           ) : (
             renderOrdersTable(
-              closedOrders
-                .filter((o) => !selectedAccount || o.account_id === selectedAccount)
-                .slice(0, 50)
+              closedOrders.filter((o) => !selectedAccount || o.account_id === selectedAccount),
+              "closed"
             )
           )}
         </div>
+      </div>
 
+      {/* RIGHT COLUMN: Positions + Closed positions */}
+      <div style={{ display: "grid", gap: 16 }}>
+        <div style={card}>
+          <div style={cardHeaderRow}>
+            <div style={cardTitle}>Positions</div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+              <label style={smallText}>
+                Sort
+                <select
+                  style={{ ...selectStyle, width: 160, marginLeft: 8, padding: "4px 8px" }}
+                  value={positionSort}
+                  onChange={(e) => setPositionSort(e.target.value as any)}
+                >
+                  <option value="entered">Entered</option>
+                  <option value="symbol">Symbol</option>
+                  <option value="pnl">P&amp;L</option>
+                </select>
+              </label>
+              <span style={smallText}>Source: Trader /v1/portfolio/positions</span>
+              <button type="button" style={dangerButton} onClick={handleFlattenAll} title="Flatten ALL positions (account)">
+                Flatten all
+              </button>
+              <button type="button" style={dangerButton} onClick={handleCancelAllOrders} title="Cancel ALL active orders (account)">
+                Cancel orders
+              </button>
+            </div>
+          </div>
+          {renderPositions()}
+        </div>
+
+        <div style={card}>
+          <div style={cardHeaderRow}>
+            <div style={cardTitle}>Closed positions</div>
+            <span style={smallText}>Derived from filled exits (fast truth view)</span>
+          </div>
+          {closedPositions.length ? (
+            <div style={{ height: 220, overflowY: "auto", overflowX: "hidden", marginTop: 6 }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", tableLayout: "fixed" }}>
+                <thead>
+                  <tr style={{ borderBottom: "1px solid #111827" }}>
+                    <th style={thStyle}>Time</th>
+                    <th style={thStyle}>Symbol</th>
+                    <th style={thStyle}>Qty</th>
+                    <th style={thStyle}>Entry</th>
+                    <th style={thStyle}>Exit</th>
+                    <th style={thStyle}>P/L</th>
+                    <th style={thStyle}>Reason</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {closedPositions
+                    .filter((r: any) => !selectedAccount || (r.account_id && r.account_id === selectedAccount))
+                    .map((r, idx) => (
+                      <tr key={`closed:${r.symbol}:${r.exit_ts || ""}:${r.qty}:${idx}`}>
+                        <td style={tdStyle}>{fmtTsNY(r.exit_ts || "")}</td>
+                        <td style={tdStyle}>{r.symbol}</td>
+                        <td style={tdStyle}>{formatNumber(r.qty, 0)}</td>
+                        <td style={tdStyle}>{r.entry_price != null ? formatCurrency(r.entry_price) : "-"}</td>
+                        <td style={tdStyle}>{r.exit_price != null ? formatCurrency(r.exit_price) : "-"}</td>
+                        <td style={{ ...tdStyle, color: r.pnl != null ? (r.pnl >= 0 ? "#bbf7d0" : "#fecaca") : (tdStyle as any).color }}>
+                          {r.pnl != null ? formatCurrency(r.pnl) : "-"}
+                        </td>
+                        <td style={tdStyle}>
+                          <span style={badge(r.exit_reason === "stop" ? "#f97316" : r.exit_reason === "target" ? "#22c55e" : "#e5e7eb")}>
+                            {r.exit_reason.toUpperCase()}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <div style={smallText}>No closed positions yet.</div>
+          )}
+        </div>
       </div>
     </div>
   );

@@ -53,6 +53,12 @@ if not exist "%PY%" (
   exit /b 2
 )
 
+set "REFLEX_MODE=LIVE"
+
+echo %GARNET_URL%
+echo %REDIS_URL%
+echo %REFLEX_MODE%
+
 echo [RUN] %PY% tools\tap_bars.py %*
 "%PY%" "tools\tap_bars.py" %*
 set "RC=%ERRORLEVEL%"

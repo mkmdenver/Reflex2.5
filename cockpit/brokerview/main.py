@@ -177,54 +177,75 @@ async def market_session() -> MarketSessionDoc:
 async def accounts() -> AccountsResponse:
     """
     UI-facing account overview.
-    Calls Trader’s /v1/portfolio/overview and normalizes into [AccountSummary].
+
+    Preferred source: Trader’s /v1/accounts (stable, list-based).
+    Fallback: Trader’s /v1/portfolio/overview (older shape).
     """
-    url = f"{TRADER_BASE}/v1/portfolio/overview"
     async with httpx.AsyncClient(timeout=10) as client:
+        # 1) Preferred: /v1/accounts
         try:
-            resp = await client.get(url)
+            resp = await client.get(f"{TRADER_BASE}/v1/accounts")
             resp.raise_for_status()
-        except httpx.HTTPError as e:
-            log.exception("Error fetching accounts overview from Trader: %s", e)
-            raise HTTPException(status_code=502, detail="Trader unavailable")
+            raw = resp.json()
+            items = raw.get("items") or []
+        except httpx.HTTPError:
+            # 2) Fallback: /v1/portfolio/overview (shape has drifted over time)
+            try:
+                resp = await client.get(f"{TRADER_BASE}/v1/portfolio/overview")
+                resp.raise_for_status()
+                raw = resp.json()
+                accounts_map = raw.get("accounts") or raw.get("overview") or {}
+                if isinstance(accounts_map, dict):
+                    items = list(accounts_map.values())
+                elif isinstance(accounts_map, list):
+                    items = accounts_map
+                else:
+                    items = []
+            except httpx.HTTPError as e:
+                log.exception("Error fetching accounts from Trader: %s", e)
+                raise HTTPException(status_code=502, detail="Trader unavailable")
 
-        raw = resp.json()
-        overview = PortfolioOverview(**raw)
+    out: List[AccountSummary] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
 
-        out: List[AccountSummary] = []
-        for account_id, ov in overview.overview.items():
-            balances = ov.balances
-            cash = balances.cash or 0.0
-            equity = balances.equity or 0.0
-            buying_power = balances.buying_power or 0.0
+        account_id = str(it.get("account_id") or "")
+        if not account_id:
+            continue
 
-            broker, _, acct_type = account_id.partition(":")
-            broker = broker or "unknown"
-            acct_type = acct_type or "unknown"
+        broker = str(it.get("broker_id") or "").strip() or account_id.split(":", 1)[0]
+        acct_type = account_id.split(":", 1)[1] if ":" in account_id and len(account_id.split(":", 1)) == 2 else "unknown"
 
-            label = f"{broker.capitalize()} {acct_type.capitalize()}"
-            status = "ACTIVE"
-            if broker == "sim":
-                status = "SIM"
-            elif broker == "alpaca":
-                status = "LIVE"
+        cash = float(it.get("cash") or 0.0)
+        equity = float(it.get("equity") or 0.0)
+        buying_power = float(it.get("buying_power") or 0.0)
+        updated_at = it.get("updated_at")
 
-            out.append(
-                AccountSummary(
-                    account_id=account_id,
-                    label=label,
-                    broker=broker,
-                    account_type=acct_type,
-                    status=status,
-                    currency="USD",
-                    cash=cash,
-                    equity=equity,
-                    buying_power=buying_power,
-                    updated_at=balances.updated_at,
-                )
+        label = str(it.get("label") or "").strip() or account_id
+
+        status = "ACTIVE"
+        if broker == "sim":
+            status = "SIM"
+        elif broker == "alpaca":
+            status = "PAPER" if acct_type == "paper" else "LIVE"
+
+        out.append(
+            AccountSummary(
+                account_id=account_id,
+                label=label,
+                broker=broker,
+                account_type=acct_type,
+                status=status,
+                currency="USD",
+                cash=cash,
+                equity=equity,
+                buying_power=buying_power,
+                updated_at=updated_at,
             )
+        )
 
-        return AccountsResponse(accounts=out)
+    return AccountsResponse(accounts=out)
 
 
 @app.get("/v1/positions", response_model=PositionsResponse)
@@ -246,8 +267,13 @@ async def positions(account: Optional[str] = None) -> PositionsResponse:
             raise HTTPException(status_code=502, detail="Trader unavailable")
 
         raw = resp.json()
+
+        # Trader returns {"items":[...], "account_id":"alpaca:paper"} but items often lack account_id.
+        top_account_id = raw.get("account_id") or (account or "")
+
         docs: List[PositionDoc] = []
-        for p in raw.get("positions", []):
+        raw_positions = raw.get("positions") or raw.get("items") or []
+        for p in raw_positions:
             qty = p.get("qty") or 0.0
             side = p.get("side")
             if side is None:
@@ -258,7 +284,7 @@ async def positions(account: Optional[str] = None) -> PositionsResponse:
 
             docs.append(
                 PositionDoc(
-                    account_id=p.get("account_id", ""),
+                    account_id=p.get("account_id") or top_account_id,
                     symbol=p.get("symbol", ""),
                     qty=qty,
                     avg_price=p.get("avg_price") or 0.0,
@@ -268,13 +294,15 @@ async def positions(account: Optional[str] = None) -> PositionsResponse:
                     unrealized_plpc=p.get("unrealized_plpc"),
                     realized_pl=p.get("realized_pl"),
                     side=side,
-                    raw=p,
                     stop_price=p.get("stop_price"),
-                    target_price=p.get("target_price"),     
+                    target_price=p.get("target_price"),
+                    take_profit_price=p.get("take_profit_price"),
+                    raw=p,
                 )
             )
 
         return PositionsResponse(positions=docs)
+
 
 
 @app.get("/v1/orders", response_model=OrdersResponse)
@@ -303,12 +331,15 @@ async def orders(status: str = "all", account: Optional[str] = None) -> OrdersRe
                 r2 = await client.get(f"{TRADER_BASE}/v1/orders", params=p2)
                 r1.raise_for_status()
                 r2.raise_for_status()
-                raw_orders = (r1.json().get("orders") or []) + (r2.json().get("orders") or [])
+                j1 = r1.json()
+                j2 = r2.json()
+                raw_orders = (j1.get("orders") or j1.get("items") or []) + (j2.get("orders") or j2.get("items") or [])
             else:
                 p = dict(params_base, status=status)
                 resp = await client.get(f"{TRADER_BASE}/v1/orders", params=p)
                 resp.raise_for_status()
-                raw_orders = resp.json().get("orders") or []
+                j = resp.json()
+                raw_orders = j.get("orders") or j.get("items") or []
         except httpx.HTTPError as e:
             log.exception("Error fetching orders from Trader: %s", e)
             raise HTTPException(status_code=502, detail="Trader unavailable")
@@ -339,6 +370,7 @@ async def orders(status: str = "all", account: Optional[str] = None) -> OrdersRe
 
 
 @app.post("/v1/orders")
+@app.post("/v1/orders/place")
 async def place_order(order: OrderIn) -> Dict[str, Any]:
     payload = order.model_dump(by_alias=True)
     payload["note"] = payload.get("note") or ""
@@ -360,12 +392,76 @@ class AccountActionIn(BaseModel):
     account_id: str
 
 
+class PositionActionIn(BaseModel):
+    account_id: str
+    symbol: str
+
+
+@app.post("/v1/positions/flatten")
+async def flatten_one(body: PositionActionIn) -> Dict[str, Any]:
+    """Flatten a single position symbol (best-effort).
+
+    Notes:
+    - Trader currently provides account-level flatten/cancel endpoints.
+    - For live testing, this endpoint submits a market order sized to the
+      broker position qty for this symbol.
+    - Any existing active orders for the symbol are NOT cancelled (Trader has
+      no per-order cancel endpoint today). The UI warns about this.
+    """
+
+    aid = (body.account_id or "").strip()
+    sym = (body.symbol or "").strip().upper()
+    if not aid or not sym:
+        raise HTTPException(status_code=400, detail="account_id and symbol are required")
+
+    async with httpx.AsyncClient(timeout=20) as cli:
+        # Fetch current position from Trader (source of truth for qty/side)
+        try:
+            resp = await cli.get(f"{TRADER_BASE}/v1/portfolio/positions", params={"account_id": aid})
+            resp.raise_for_status()
+            items = resp.json().get("positions") or []
+        except httpx.HTTPError as e:
+            log.exception("Error fetching positions from Trader for flatten_one: %s", e)
+            raise HTTPException(status_code=502, detail="Trader unavailable")
+
+        pos = next((p for p in items if str(p.get("symbol", "")).upper() == sym), None)
+        if not pos:
+            return {"ok": False, "error": f"No open position for {sym}", "account_id": aid, "symbol": sym}
+
+        qty = float(pos.get("qty") or 0)
+        if qty <= 0:
+            return {"ok": False, "error": f"Position qty not positive for {sym}", "account_id": aid, "symbol": sym}
+
+        side = str(pos.get("side") or "long").lower()
+        order_side = "sell" if side != "short" else "buy"
+
+        payload = {
+            "account_id": aid,
+            "symbol": sym,
+            "side": order_side,
+            "type": "market",
+            "qty": qty,
+            "time_in_force": "day",
+            "note": f"flatten_one:{sym}",
+        }
+
+        try:
+            r2 = await cli.post(f"{TRADER_BASE}/v1/orders/place", json=payload)
+            if r2.status_code >= 400:
+                raise HTTPException(status_code=r2.status_code, detail=r2.text)
+            return {"ok": True, "account_id": aid, "symbol": sym, "submitted": r2.json()}
+        except HTTPException:
+            raise
+        except httpx.HTTPError as e:
+            log.exception("Error placing flatten_one via Trader: %s", e)
+            raise HTTPException(status_code=502, detail="Trader unavailable")
+
+
 @app.post("/v1/accounts/flatten")
 async def flatten_account(body: AccountActionIn) -> Dict[str, Any]:
     async with httpx.AsyncClient(timeout=20) as cli:
         try:
             resp = await cli.post(f"{TRADER_BASE}/v1/accounts/flatten", json={"account_id": body.account_id})
-            # If Trader returned a real error, propagate it (don't lie as "unavailable")
             if resp.status_code >= 400:
                 raise HTTPException(status_code=resp.status_code, detail=resp.text)
             return resp.json()
@@ -378,7 +474,6 @@ async def flatten_account(body: AccountActionIn) -> Dict[str, Any]:
         except httpx.HTTPError as e:
             log.exception("Error flattening account via Trader: %s", e)
             raise HTTPException(status_code=502, detail="Trader unavailable")
-
 
 
 @app.post("/v1/accounts/cancel_all")

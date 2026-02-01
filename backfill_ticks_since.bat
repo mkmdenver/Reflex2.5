@@ -27,7 +27,7 @@ if not exist "%PY%" set "PY=python"
 set "MODULE=tools.symbol_manager.db_backfill"
 
 echo [RUN] TICK backfill ALL since %SINCE%
-"%PY%" -m %MODULE% --kind tick --symbol ALL --since %SINCE%
+"%PY%" -m %MODULE% --kind tick --start-symbol ALL --since %SINCE%
 set "RC=%errorlevel%"
 
 if not "%RC%"=="0" (

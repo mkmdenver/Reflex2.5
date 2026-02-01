@@ -1,66 +1,123 @@
 # trader/app.py
-# v2.1.0 – Trader HTTP API for BrokerView and auto-intent bridge.
+# v2.1.2 – Trader HTTP API + telemetry plumbing (ACK/FILL instrumentation)
 #
-# HARD RULES (enforced):
-#   1) UI-poll endpoints MUST be cache-only:
-#        - /v1/portfolio/positions reads pm.portfolio cache only
-#        - /v1/orders reads local ledger cache only
-#      They NEVER call the broker.
-#   2) Broker I/O happens only in background tasks:
-#        - startup sync
-#        - websocket trade updates (Alpaca)
-#        - periodic reconcile + periodic orders cache refresh
-#   3) If broker is slow/offline, endpoints still return cached data with stale flags.
-#
-# This prevents BrokerView timeouts and “Failed to fetch” during demos.
+# v2.1.2:
+#   - Add compatibility endpoints for BrokerView:
+#       /v1/portfolio/overview
+#       /v1/portfolio/positions?account_id=...
+#       /v1/accounts
+#   - Keep TradeRunner constructor signature fix (store/alerts/adapters/portfolio_manager).
 
 import os
 import time
-import random
 import asyncio
 import logging
 import threading
-import json as _json
-from uuid import uuid4
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List, Deque
 from collections import deque as _deque
-
-from fastapi import FastAPI, Request, Query, HTTPException
+from uuid import uuid4
+from fastapi import FastAPI, Query, HTTPException, Request
 from fastapi.responses import JSONResponse
-from starlette.responses import StreamingResponse as _StreamingResponse
 
 from .portfolio_manager import PortfolioManager
 from .alpaca_trade_updates import listen_trade_updates
 from .trade_runner import TradeRunner
 
 log = logging.getLogger("trader.app")
-app = FastAPI(title="Reflex Trader API", version="2.1.0")
+app = FastAPI(title="Reflex Trader API", version="2.1.2")
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-# ---------------------------------------------------------------------------
-# Global portfolio manager instance
-# ---------------------------------------------------------------------------
-
 pm = PortfolioManager()
+
+def _env_present(*keys: str) -> bool:
+    return any((os.getenv(k) or "").strip() for k in keys)
+
+async def _register_adapters_once() -> None:
+    """Register broker adapters before background loops start.
+
+    If adapters are never registered, BrokerView will show an empty account
+    dropdown and downstream endpoints become meaningless.
+    """
+    # 1) DB-backed registry (preferred when configured)
+    try:
+        fn = getattr(pm, "register_from_db", None)
+        if fn is not None:
+            
+            if asyncio.iscoroutinefunction(fn):
+                await fn()
+            else:
+                await asyncio.to_thread(fn)
+    except Exception:
+        log.exception("startup.register_from_db.failed")
+
+    # 2) Env fallback (restores the "worked yesterday" behavior when DB is empty)
+    try:
+        if not getattr(pm, "adapters", {}):
+            # Alpaca
+            if _env_present("ALPACA_API_KEY_ID", "ALPACA_API_KEY") and _env_present("ALPACA_API_SECRET_KEY", "ALPACA_API_SECRET"):
+                from .adapters.alpaca_adapter import AlpacaAdapter
+
+                key_id = (os.getenv("ALPACA_API_KEY_ID") or os.getenv("ALPACA_API_KEY") or "").strip()
+                secret = (os.getenv("ALPACA_API_SECRET_KEY") or os.getenv("ALPACA_API_SECRET") or "").strip()
+                base = (os.getenv("ALPACA_BASE_URL") or "https://paper-api.alpaca.markets").strip()
+                # Keep the canonical account_id BrokerView already uses
+                aid = (os.getenv("TRADER_DEFAULT_ACCOUNT_ID") or "alpaca:paper").strip()
+                pm.adapters[aid] = AlpacaAdapter(account_id=aid, base=base, key_id=key_id, secret=secret)
+
+            # SIM fallback (useful even without broker creds)
+            if not getattr(pm, "adapters", {}):
+                from .portfolio_manager import SimAdapter
+
+                sim_id = (os.getenv("TRADER_SIM_ACCOUNT_ID") or "sim:cash").strip()
+                pm.adapters[sim_id] = SimAdapter(account_id=sim_id, starting_cash=float(os.getenv("TRADER_SIM_STARTING_CASH", "100000") or 100000), margin=False)
+    except Exception:
+        log.exception("startup.env_fallback.failed")
 
 # ---------------------------------------------------------------------------
 # Async safety – never block the event loop
 # ---------------------------------------------------------------------------
 
 async def _call_maybe_async(fn, *args, **kwargs):
-    """
-    Call fn safely from the asyncio loop.
-    - If fn is async -> await it
-    - If fn is sync  -> run it in a worker thread
-    """
     if fn is None:
         return None
     if asyncio.iscoroutinefunction(fn):
         return await fn(*args, **kwargs)
     return await asyncio.to_thread(fn, *args, **kwargs)
+
+
+def _default_account_id() -> str | None:
+    try:
+        if len(pm.adapters) == 1:
+            return next(iter(pm.adapters.keys()))
+        return None
+    except Exception:
+        return None
+
+def _fail_local(client_id: str, aid: str, reason: str, status: str = "failed") -> None:
+    try:
+        o = _LOCAL_ORDERS.get(client_id)
+        if not o:
+            return
+        o["status"] = status
+        o["error"] = reason
+        o["updated_at"] = _iso_now()
+    except Exception:
+        pass
+
+def _broker_id_from_result(res):
+    try:
+        if isinstance(res, dict):
+            return res.get("id") or res.get("order_id") or res.get("broker_order_id")
+        return getattr(res, "id", None) or getattr(res, "order_id", None)
+    except Exception:
+        return None
+
+
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 # ---------------------------------------------------------------------------
 # Local Orders Ledger (cache)
@@ -68,9 +125,6 @@ async def _call_maybe_async(fn, *args, **kwargs):
 
 _LOCAL_ORDERS: Dict[str, Dict[str, Any]] = {}     # key: broker id when known, else client id
 _CLIENT_TO_BROKER: Dict[str, str] = {}            # client_id -> broker_id
-
-def _iso_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 def _is_closed_status(st: Optional[str]) -> bool:
     s = (st or "").lower()
@@ -83,6 +137,183 @@ def _is_active_status(st: Optional[str]) -> bool:
     if _is_closed_status(s):
         return False
     return s in ("pending_local", "new", "accepted", "pending_new", "submitted", "partially_filled", "open")
+
+# ---------------------------------------------------------------------------
+# Managed Trades (in-memory; TradeRunner reads these through StoreShim)
+# ---------------------------------------------------------------------------
+
+_MANAGED_TRADES: Dict[str, Dict[str, Any]] = {}
+_INTENT_HISTORY: Deque[Dict[str, Any]] = _deque(maxlen=500)
+
+# ---------------------------------------------------------------------------
+# Intent -> Trade (missing machinery)
+# ---------------------------------------------------------------------------
+
+def _norm_intent_payload(payload: Any) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Accept either {intent:{...}, meta:{...}} or a flat dict."""
+    if isinstance(payload, dict) and isinstance(payload.get("intent"), dict):
+        intent = payload.get("intent") or {}
+        meta = payload.get("meta") or {}
+        return dict(intent), dict(meta) if isinstance(meta, dict) else {}
+    if isinstance(payload, dict):
+        return dict(payload), {}
+    return {}, {}
+
+def _find_existing_trade(aid: str, symbol: str) -> Optional[Dict[str, Any]]:
+    try:
+        for t in _MANAGED_TRADES.values():
+            if not isinstance(t, dict):
+                continue
+            if str(t.get("account_id") or "") != aid:
+                continue
+            if str(t.get("symbol") or "").upper() != symbol.upper():
+                continue
+            st = str(t.get("state") or "").upper()
+            if st not in ("DONE", "ERROR"):
+                return t
+    except Exception:
+        pass
+    return None
+
+def _default_bot_qty() -> float:
+    # Keep this boring and env-driven.
+    # You can later replace with Risk/Capital sizing.
+    try:
+        return float(os.getenv("TRADER_DEFAULT_QTY") or os.getenv("TRADER_BOT_QTY") or "1")
+    except Exception:
+        return 1.0
+
+@app.post("/v1/intents")
+async def api_intents_ingest(request: Request):
+    """Standard execution front-door: turn an intent into a managed trade.
+
+    This is what broker_worker expects to call.
+    TradeRunner will place the entry order asynchronously.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    intent, meta = _norm_intent_payload(payload)
+
+    symbol = str(intent.get("symbol") or "").strip().upper()
+    side = str(intent.get("side") or "").strip().lower()
+    if side in ("short", "sell_short", "sellshort"):
+        side = "sell"
+    account_id = (intent.get("account_id") or intent.get("account") or "").strip() or None
+    if not account_id:
+        account_id = _default_account_id()
+    if not account_id:
+        return JSONResponse({"ok": False, "error": "account_id required (multiple accounts present)"}, status_code=400)
+
+    if account_id not in pm.adapters:
+        return JSONResponse({"ok": False, "error": f"unknown account_id: {account_id}"}, status_code=404)
+
+    if not symbol or side not in ("buy", "sell"):
+        return JSONResponse({"ok": False, "error": "intent requires symbol and side (buy|sell)"}, status_code=400)
+
+    # prevent duplicate active trades per (account,symbol)
+    existing = _find_existing_trade(account_id, symbol)
+    if existing is not None:
+        return {"ok": True, "status": "ignored_duplicate", "trade_id": existing.get("trade_id"), "symbol": symbol, "account_id": account_id}
+
+    qty = intent.get("qty") or intent.get("shares") or intent.get("quantity")
+    try:
+        qty_f = float(qty) if qty not in (None, "", 0) else _default_bot_qty()
+    except Exception:
+        qty_f = _default_bot_qty()
+    if qty_f <= 0:
+        qty_f = _default_bot_qty()
+
+    trade_id = str(intent.get("trade_id") or intent.get("intent_id") or uuid4())
+    sess = str(intent.get("market_session") or os.getenv("MARKET_SESSION") or "RTH").upper()
+    if sess not in ("PRE", "RTH", "POST"):
+        sess = "RTH"
+
+    trade = {
+        "trade_id": trade_id,
+        "account_id": account_id,
+        "symbol": symbol,
+        "side": side,
+        "qty": qty_f,
+        "state": "ENTRY_PENDING",
+        "created_ts": time.time(),
+        "market_session": sess,
+        "strategy_id": intent.get("strategy_id") or intent.get("strategy"),
+        "intent_strength": intent.get("strength"),
+        "intent": intent,
+        "meta": meta,
+    }
+
+    _MANAGED_TRADES[trade_id] = trade
+
+    # keep short history for debugging
+    try:
+        _INTENT_HISTORY.append(
+            {
+                "ts": _iso_now(),
+                "trade_id": trade_id,
+                "account_id": account_id,
+                "symbol": symbol,
+                "side": side,
+                "qty": qty_f,
+                "strategy_id": trade.get("strategy_id"),
+                "strength": trade.get("intent_strength"),
+            }
+        )
+    except Exception:
+        pass
+
+    return {"ok": True, "status": "accepted", "trade_id": trade_id, "account_id": account_id, "symbol": symbol, "side": side, "qty": qty_f}
+
+@app.get("/v1/intents/recent")
+async def api_intents_recent(limit: int = Query(50, ge=1, le=500)):
+    try:
+        items = list(_INTENT_HISTORY)[-int(limit):]
+        items.reverse()
+        return {"items": items}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/v1/trades")
+async def api_trades(account_id: Optional[str] = Query(None), state: Optional[str] = Query(None), limit: int = Query(500, ge=1, le=2000)):
+    try:
+        out = []
+        for t in list(_MANAGED_TRADES.values()):
+            if account_id and t.get("account_id") != account_id:
+                continue
+            if state and str(t.get("state") or "").upper() != str(state).upper():
+                continue
+            out.append(dict(t))
+        out.sort(key=lambda x: float(x.get("created_ts") or 0.0), reverse=True)
+        return {"items": out[: int(limit)]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+_LAST_ORDERS_SYNC_TS: float = 0.0
+_LAST_ORDERS_SYNC_ERR: Optional[str] = None
+
+# ---------------------------------------------------------------------------
+# BrokerView helpers (entry price on exits so P/L can be computed)
+# ---------------------------------------------------------------------------
+
+def _avg_entry_price_for_order(o: Dict[str, Any]) -> Optional[float]:
+    try:
+        cid = str(o.get("client_order_id") or "")
+        if ":exit:" not in cid or ":" not in cid:
+            return None
+        trade_id = cid.split(":", 1)[0]
+        t = _MANAGED_TRADES.get(trade_id)
+        if not isinstance(t, dict):
+            return None
+        px = t.get("entry_avg_price")
+        if px is None:
+            return None
+        return float(px)
+    except Exception:
+        return None
 
 def _local_order_doc(o: Dict[str, Any]) -> Dict[str, Any]:
     return {
@@ -99,1271 +330,382 @@ def _local_order_doc(o: Dict[str, Any]) -> Dict[str, Any]:
         "submitted_at": o.get("submitted_at"),
         "updated_at": o.get("updated_at"),
         "client_order_id": o.get("client_order_id"),
+        "avg_entry_price": _avg_entry_price_for_order(o),
         "broker_order_id": o.get("broker_order_id") or o.get("id"),
+        # Telemetry fields (set by trade_updates)
+        "ack_ts": o.get("ack_ts"),
+        "first_fill_ts": o.get("first_fill_ts"),
+        "first_fill_price": o.get("first_fill_price"),
+        "filled_ts": o.get("filled_ts"),
+        "avg_fill_price": o.get("avg_fill_price") or o.get("filled_avg_price"),
         "filled_qty": o.get("filled_qty"),
-        "filled_avg_price": o.get("filled_avg_price"),
         "source": o.get("source"),
         "note": o.get("note"),
         "error": o.get("error"),
     }
 
-def _fail_local(client_id: str, aid: str, reason: str, status: str = "failed") -> None:
+def _expire_stale_pending_locals() -> None:
     try:
+        now = time.time()
+        kill: List[str] = []
+        for k, o in list(_LOCAL_ORDERS.items()):
+            if o.get("source") != "local":
+                continue
+            st = str(o.get("status") or "")
+            if st not in ("pending_local", "pending_new", "submitted"):
+                continue
+            ts = float(o.get("created_ts") or 0.0)
+            if ts and (now - ts) > 90.0:
+                kill.append(k)
+        for k in kill:
+            _LOCAL_ORDERS.pop(k, None)
+    except Exception:
+        pass
+
+def _get_local_order_by_any_id(broker_id: Optional[str], client_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    if broker_id:
+        o = _LOCAL_ORDERS.get(broker_id)
+        if o:
+            return o
+    if client_id:
         o = _LOCAL_ORDERS.get(client_id)
-        if not o:
-            return
-        o["status"] = status
-        o["error"] = reason
-        o["updated_at"] = _iso_now()
-        publish_event({
-            "type": "ORDER_LOCAL_FAILED",
-            "ts": time.time(),
-            "account_id": aid,
-            "order": _local_order_doc(o),
-            "error": reason,
-        })
-    except Exception:
-        pass
-
-def _upsert_local_from_broker(aid: str, broker_doc: Dict[str, Any]) -> None:
-    """
-    Merge broker order snapshot into local ledger.
-    Uses broker id as the stable key.
-    """
-    bid = broker_doc.get("id")
-    if not bid:
-        return
-
-    client_id = None
-    for cid, mapped in list(_CLIENT_TO_BROKER.items()):
-        if mapped == bid:
-            client_id = cid
-            break
-
-    existing = _LOCAL_ORDERS.get(bid)
-    if not existing and client_id:
-        existing = _LOCAL_ORDERS.get(client_id)
-
-    if existing:
-        merged = dict(existing)
-        merged.update({k: v for k, v in broker_doc.items() if v is not None})
-        merged["account_id"] = aid
-        merged["id"] = bid
-        merged["updated_at"] = _iso_now()
-        _LOCAL_ORDERS[bid] = merged
-        if client_id and client_id in _LOCAL_ORDERS:
-            _LOCAL_ORDERS.pop(client_id, None)
-    else:
-        merged = dict(broker_doc)
-        merged["account_id"] = aid
-        merged["id"] = bid
-        merged["updated_at"] = _iso_now()
-        _LOCAL_ORDERS[bid] = merged
-
-# ---------------------------------------------------------------------------
-# Trader Event Hub (SSE)
-# ---------------------------------------------------------------------------
-
-_EVENT_HISTORY = _deque(maxlen=500)
-_EVENT_SUBSCRIBERS = set()          # set[asyncio.Queue]
-_MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
-
-def _event_payload(evt: Dict[str, Any]) -> Dict[str, Any]:
-    if "ts" not in evt:
-        evt = dict(evt)
-        evt["ts"] = time.time()
-    if "id" not in evt:
-        evt = dict(evt)
-        evt["id"] = str(uuid4())
-    return evt
-
-def publish_event(evt: Dict[str, Any]) -> None:
-    payload = _event_payload(evt)
-
-    def _do_publish() -> None:
-        _EVENT_HISTORY.append(payload)
-        dead = []
-        for q in list(_EVENT_SUBSCRIBERS):
-            try:
-                q.put_nowait(payload)
-            except Exception:
-                dead.append(q)
-        for q in dead:
-            _EVENT_SUBSCRIBERS.discard(q)
-
-    try:
-        loop = _MAIN_LOOP
-        if loop and loop.is_running():
-            loop.call_soon_threadsafe(_do_publish)
-        else:
-            _do_publish()
-    except Exception:
-        pass
-
-async def _sse_event_generator(request: Request):
-    q: asyncio.Queue = asyncio.Queue(maxsize=200)
-    _EVENT_SUBSCRIBERS.add(q)
-
-    # replay last events
-    try:
-        for evt in list(_EVENT_HISTORY)[-50:]:
-            yield f"data: {_json.dumps(evt, separators=(',',':'))}\n\n"
-    except Exception:
-        pass
-
-    try:
-        while True:
-            if await request.is_disconnected():
-                break
-            try:
-                evt = await asyncio.wait_for(q.get(), timeout=15.0)
-                yield f"data: {_json.dumps(evt, separators=(',',':'))}\n\n"
-            except asyncio.TimeoutError:
-                yield ": ping\n\n"
-            except Exception:
-                yield ": error\n\n"
-    finally:
-        _EVENT_SUBSCRIBERS.discard(q)
-
-# ---------------------------------------------------------------------------
-# Pending-local expiry
-# ---------------------------------------------------------------------------
-
-_PENDING_LOCAL_TTL_SECS: float = float(os.getenv("TRADER_PENDING_LOCAL_TTL_SECS", "8") or 8)
-
-def _parse_iso_ts(s: Any) -> Optional[float]:
-    try:
-        if not s:
-            return None
-        if isinstance(s, (int, float)):
-            return float(s)
-        if isinstance(s, datetime):
-            dt = s
-        else:
-            ss = str(s).strip()
-            if ss.endswith("Z") and "+" not in ss:
-                ss = ss[:-1] + "+00:00"
-            dt = datetime.fromisoformat(ss)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return float(dt.timestamp())
-    except Exception:
-        return None
-
-def _pending_age_secs(o: Dict[str, Any], now_ts: Optional[float] = None) -> Optional[float]:
-    try:
-        now = float(now_ts if now_ts is not None else time.time())
-        ts = _parse_iso_ts(o.get("submitted_at")) or _parse_iso_ts(o.get("created_at"))
-        if ts is None:
-            return None
-        return max(0.0, now - ts)
-    except Exception:
-        return None
-
-def _expire_stale_pending_locals(now_ts: Optional[float] = None) -> int:
-    ttl = max(2.0, min(float(_PENDING_LOCAL_TTL_SECS), 120.0))
-    now = float(now_ts if now_ts is not None else time.time())
-    expired = 0
-    for oid, o in list(_LOCAL_ORDERS.items()):
-        try:
-            if str(o.get("status") or "").lower() != "pending_local":
-                continue
-            age = _pending_age_secs(o, now_ts=now)
-            if age is None or age < ttl:
-                continue
-            o["status"] = "failed"
-            o["error"] = f"pending_local_timeout>{ttl:.0f}s"
-            o["updated_at"] = _iso_now()
-            expired += 1
-            publish_event({"type": "ORDER_LOCAL_EXPIRED", "ts": now, "account_id": o.get("account_id"), "order": _local_order_doc(o), "age_s": age, "ttl_s": ttl})
-        except Exception:
-            continue
-    return expired
-
-def _broker_id_from_result(res: Any) -> Optional[str]:
-    try:
-        if res is None:
-            return None
-        if hasattr(res, "to_dict"):
-            d = res.to_dict()
-        elif isinstance(res, dict):
-            d = res
-        else:
-            return None
-        bid = d.get("id") or d.get("order_id") or d.get("broker_order_id")
-        return str(bid) if bid else None
-    except Exception:
-        return None
-
-# ---------------------------------------------------------------------------
-# Managed trades / journal / runner (kept as in prior versions)
-# ---------------------------------------------------------------------------
-
-_MANAGED_TRADES: Dict[str, Dict[str, Any]] = {}
-_INTENT_HISTORY: Deque[Dict[str, Any]] = _deque(maxlen=500)
-
-_JOURNAL_MTIME: float = 0.0
-_JOURNAL_LOCK = threading.Lock()
-
-_bg_reconcile_task: Optional[asyncio.Task] = None
-_bg_events_tasks: List[asyncio.Task] = []
-_bg_events_stop: Optional[asyncio.Event] = None
-_bg_orders_task: Optional[asyncio.Task] = None
-
-_TRADE_RUNNER: Optional[TradeRunner] = None
-
-def _truthy_env(name: str, default: str = "0") -> bool:
-    v = str(os.getenv(name, default)).strip().lower()
-    return v in ("1", "true", "yes", "y", "on")
-
-def _repo_root() -> str:
-    return os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
-
-_JOURNAL_ENABLED: bool = _truthy_env("REFLEX__TRADER_JOURNAL", "0")
-
-def _journal_path() -> str:
-    p = (os.getenv("REFLEX__TRADER_JOURNAL_PATH") or "").strip()
-    if p:
-        return p
-    return os.path.join(_repo_root(), "logs", "trader", "trade_journal.jsonl")
-
-def _journal_append(kind: str, payload: Dict[str, Any]) -> None:
-    if not _JOURNAL_ENABLED:
-        return
-    try:
-        jp = _journal_path()
-        os.makedirs(os.path.dirname(jp), exist_ok=True)
-        rec = {"ts": time.time(), "kind": kind, "payload": payload}
-        with open(jp, "a", encoding="utf-8") as f:
-            f.write(_json.dumps(rec, separators=(",", ":"), ensure_ascii=False))
-            f.write("\n")
-    except Exception:
-        log.exception("journal.append.failed kind=%r", kind)
-
-def _journal_replay() -> None:
-    if not _JOURNAL_ENABLED:
-        return
-    jp = _journal_path()
-    if not os.path.exists(jp):
-        return
-    try:
-        intents: dict[str, dict] = {}
-        trades: dict[str, dict] = {}
-        with open(jp, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = _json.loads(line)
-                except Exception:
-                    continue
-                kind = rec.get("kind")
-                payload = rec.get("payload") or {}
-                if kind == "intent":
-                    iid = payload.get("intent_id") or payload.get("id")
-                    if iid:
-                        intents[str(iid)] = payload
-                elif kind == "trade":
-                    tid = payload.get("trade_id") or payload.get("id")
-                    if tid:
-                        trades[str(tid)] = payload
-        for it in intents.values():
-            _INTENT_HISTORY.append(it)
-        for tid, tr in trades.items():
-            _MANAGED_TRADES[tid] = tr
-    except Exception:
-        log.exception("journal.replay.failed path=%r", jp)
-
-def _journal_sync_if_needed() -> None:
-    global _JOURNAL_MTIME
-    if not _JOURNAL_ENABLED:
-        return
-    jp = _journal_path()
-    try:
-        st = os.stat(jp)
-    except Exception:
-        return
-    mtime = float(getattr(st, "st_mtime", 0.0) or 0.0)
-    if mtime <= _JOURNAL_MTIME:
-        return
-    with _JOURNAL_LOCK:
-        try:
-            st2 = os.stat(jp)
-            mtime2 = float(getattr(st2, "st_mtime", 0.0) or 0.0)
-        except Exception:
-            return
-        if mtime2 <= _JOURNAL_MTIME:
-            return
-        _journal_replay()
-        _JOURNAL_MTIME = mtime2
-
-_journal_replay()
-
-def _new_trade_id() -> str:
-    return str(uuid4())
-
-def _new_intent_id() -> str:
-    return str(uuid4())
-
-def _default_account_id() -> Optional[str]:
-    try:
-        if len(pm.adapters) == 1:
-            return next(iter(pm.adapters.keys()))
-    except Exception:
-        pass
+        if o:
+            return o
+        mapped = _CLIENT_TO_BROKER.get(client_id)
+        if mapped:
+            o = _LOCAL_ORDERS.get(mapped)
+            if o:
+                return o
     return None
 
-# ---------------------------------------------------------------------------
-# Coercion helpers
-# ---------------------------------------------------------------------------
+def _upsert_local_telemetry(aid: str, broker_id: Optional[str], client_id: Optional[str], patch: Dict[str, Any]) -> None:
+    key = broker_id or client_id
+    if not key:
+        return
+    existing = _get_local_order_by_any_id(broker_id, client_id) or {}
+    merged = dict(existing)
+    merged.update({k: v for k, v in patch.items() if v is not None})
+    merged["account_id"] = aid
+    if broker_id:
+        merged["id"] = broker_id
+    if client_id and not merged.get("client_order_id"):
+        merged["client_order_id"] = client_id
+    merged["updated_at"] = _iso_now()
 
-def _as_float(x: Any) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        if isinstance(x, bool):
-            return None
-        if isinstance(x, (int, float)):
-            return float(x)
-        s = str(x).strip()
-        if not s:
-            return None
-        return float(s)
-    except Exception:
-        return None
-
-def _best_stop_and_target_for_position(aid: str, sym: str, side: str, mkt_price: float) -> tuple[Optional[float], Optional[float]]:
-    """
-    Infer stop/target from cached local orders (_LOCAL_ORDERS) and/or managed trades (_MANAGED_TRADES).
-    Cache-only: never calls broker.
-    """
-    s = (sym or "").upper().strip()
-    side_lc = (side or "").lower().strip()
-    if side_lc not in ("long", "short"):
-        side_lc = "long"
-
-    # For long positions: stop is SELL stop below market, target is SELL limit above market.
-    # For short positions: stop is BUY stop above market, target is BUY limit below market.
-    want_side = "sell" if side_lc == "long" else "buy"
-
-    best_stop: Optional[float] = None
-    best_tgt: Optional[float] = None
-
-    # 1) Scan local order ledger (cached)
-    try:
-        for o in (_LOCAL_ORDERS or {}).values():
-            if (o.get("account_id") or "") != aid:
-                continue
-            if str(o.get("symbol") or "").upper().strip() != s:
-                continue
-            if not _is_active_status(o.get("status")):
-                continue
-
-            o_side = str(o.get("side") or "").lower().strip()
-            o_type = str(o.get("type") or "").lower().strip()
-
-            # Protective STOP-like orders
-            if o_side == want_side and o_type in ("stop", "stop_limit", "trailing", "trailing_stop"):
-                sp = _as_float(o.get("stop_price"))
-                if sp and sp > 0:
-                    if side_lc == "long":
-                        # stop should be <= market; choose highest (tightest)
-                        if mkt_price > 0 and sp > mkt_price:
-                            continue
-                        if best_stop is None or sp > best_stop:
-                            best_stop = sp
-                    else:
-                        # short stop should be >= market; choose lowest (tightest)
-                        if mkt_price > 0 and sp < mkt_price:
-                            continue
-                        if best_stop is None or sp < best_stop:
-                            best_stop = sp
-
-            # Target TAKE-PROFIT-like (limit order)
-            if o_side == want_side and o_type == "limit":
-                lp = _as_float(o.get("limit_price"))
-                if lp and lp > 0:
-                    if side_lc == "long":
-                        # target should be >= market; choose lowest above
-                        if mkt_price > 0 and lp < mkt_price:
-                            continue
-                        if best_tgt is None or lp < best_tgt:
-                            best_tgt = lp
-                    else:
-                        # short target should be <= market; choose highest below
-                        if mkt_price > 0 and lp > mkt_price:
-                            continue
-                        if best_tgt is None or lp > best_tgt:
-                            best_tgt = lp
-    except Exception:
-        pass
-
-    # 2) Fallback to managed trade dict (if present)
-    try:
-        for t in (_MANAGED_TRADES or {}).values():
-            if (t.get("account_id") or "") != aid:
-                continue
-            if str(t.get("symbol") or "").upper().strip() != s:
-                continue
-            st = str(t.get("state") or "")
-            if st in ("DONE", "CANCELED", "ERROR", "ABORT_PROTECTION", "REJECTED"):
-                continue
-
-            if best_stop is None:
-                sp = _as_float(t.get("stop_price"))
-                if sp and sp > 0:
-                    best_stop = sp
-
-            if best_tgt is None:
-                tp = _as_float(t.get("take_profit_price"))
-                if not tp:
-                    plan = t.get("plan")
-                    if isinstance(plan, dict):
-                        ex = plan.get("exit")
-                        if isinstance(ex, dict):
-                            tp = _as_float(ex.get("target_price"))
-                if tp and tp > 0:
-                    best_tgt = tp
-    except Exception:
-        pass
-
-    return best_stop, best_tgt
-
-def _coerce_positions(raw_positions: List[Any], account_id: str) -> List[Dict[str, Any]]:
-    norm: List[Dict[str, Any]] = []
-    for p in raw_positions or []:
-        if hasattr(p, "to_dict"):
-            d = p.to_dict()
-        elif isinstance(p, dict):
-            d = dict(p)
-        else:
-            d = {"raw": repr(p)}
-
-        sym = d.get("symbol") or d.get("asset_id") or d.get("asset") or d.get("ticker")
-        qty = d.get("qty", d.get("quantity", 0) or 0) or 0
-        avg_price = d.get("avg_price", d.get("avg_fill_price", d.get("cost_basis", 0) or 0))
-        mkt_price = d.get("market_price", d.get("current_price", d.get("last_price", 0) or 0))
-        side = d.get("side") or ("long" if float(qty) >= 0 else "short")
-
-        fqty = float(qty or 0.0)
-        favg = float(avg_price or 0.0)
-        fmkt = float(mkt_price or 0.0)
-
-        # Compute unrealized P/L cache-only (truthy even if broker omits fields)
-        if fqty >= 0:
-            # long
-            upl = (fmkt - favg) * fqty
-        else:
-            # short (qty negative)
-            upl = (favg - fmkt) * abs(fqty)
-
-        # % based on cost basis
-        cost_basis = abs(fqty) * favg
-        uplpc = (upl / cost_basis * 100.0) if cost_basis > 0 else 0.0
-        mkt_value = abs(fqty) * fmkt
-
-        stop_price, target_price = _best_stop_and_target_for_position(
-            account_id,
-            str(sym or ""),
-            str(side or ""),
-            fmkt,
-        )
-
-        norm.append({
-            "account_id": account_id,
-            "symbol": sym,
-            "qty": fqty,
-            "avg_price": favg,
-            "market_price": fmkt,
-            "market_value": mkt_value,
-            "unrealized_pl": upl,
-            "unrealized_plpc": uplpc,
-            "side": side,
-            "stop_price": stop_price,
-            "target_price": target_price,
-        })
-    return norm
-
-
-def _coerce_order_dict(o: Any, account_id: str) -> Dict[str, Any]:
-    if hasattr(o, "to_dict"):
-        d = o.to_dict()
-    elif isinstance(o, dict):
-        d = dict(o)
+    if broker_id:
+        _LOCAL_ORDERS[broker_id] = merged
+        if client_id:
+            _CLIENT_TO_BROKER[client_id] = broker_id
+            _LOCAL_ORDERS.pop(client_id, None)
     else:
-        d = {"raw": repr(o)}
+        _LOCAL_ORDERS[client_id] = merged  # type: ignore[arg-type]
 
-    order_id = d.get("id") or d.get("order_id") or d.get("client_order_id")
-    sym = d.get("symbol") or d.get("asset") or d.get("ticker")
-    qty = d.get("qty", d.get("quantity", 0) or 0) or 0
-    status = d.get("status") or d.get("state")
-    submitted_at = d.get("submitted_at") or d.get("created_at") or d.get("timestamp")
-
-    return {
-        "account_id": account_id,
-        "id": order_id,
-        "symbol": sym,
-        "side": d.get("side"),
-        "qty": float(qty),
-        "type": d.get("type"),
-        "limit_price": d.get("limit_price"),
-        "stop_price": d.get("stop_price"),
-        "time_in_force": d.get("time_in_force") or d.get("tif"),
-        "status": status,
-        "submitted_at": submitted_at,
-        "updated_at": d.get("updated_at") or d.get("updatedAt"),
-        "client_order_id": d.get("client_order_id"),
-        "broker_order_id": d.get("broker_order_id") or d.get("id"),
-        "filled_qty": d.get("filled_qty"),
-        "filled_avg_price": d.get("filled_avg_price"),
-    }
-
-def _snapshot_for_account(aid: str) -> Dict[str, Any]:
-    s = pm.portfolio.get(aid)
-    if s is None:
-        return {"account_id": aid, "cash": 0.0, "equity": 0.0, "buying_power": 0.0, "positions": [], "updated_at": None}
-    raw_positions = getattr(s, "positions", [])
-    positions = _coerce_positions(raw_positions, aid)
-    return {
-        "account_id": aid,
-        "cash": float(getattr(s, "cash", 0.0)),
-        "equity": float(getattr(s, "equity", 0.0)),
-        "buying_power": float(getattr(s, "buying_power", 0.0)),
-        "positions": positions,
-        "updated_at": getattr(s, "updated_at", None),
-    }
-
-# ---------------------------------------------------------------------------
-# Broker order listing – USED ONLY by background refresh (not endpoints)
-# ---------------------------------------------------------------------------
-
-async def _broker_list_orders(aid: str, status: str) -> List[Dict[str, Any]]:
-    ad = pm.adapters.get(aid)
-    if ad is None:
-        return []
-
-    if status == "active":
-        attr_names = ("list_open_orders", "list_active_orders", "open_orders")
-    else:
-        attr_names = ("list_closed_orders", "list_orders", "closed_orders")
-
-    func = None
-    for name in attr_names:
-        func = getattr(ad, name, None)
-        if func is not None:
-            break
-    if func is None:
-        return []
-
+def _apply_trade_update_telemetry(account_id: str, evt: Dict[str, Any]) -> None:
     try:
-        # Hard time bound; do not let broker stall the refresh loop
-        timeout = max(0.5, min(float(os.getenv("TRADER_BROKER_ORDERS_TIMEOUT_SECS", "2.5") or 2.5), 15.0))
-        coro = _call_maybe_async(func)
-        orders = await asyncio.wait_for(coro, timeout=timeout)
-        return [_coerce_order_dict(o, aid) for o in (orders or [])]
-    except asyncio.TimeoutError:
-        publish_event({"type": "BROKER_ORDERS_TIMEOUT", "ts": time.time(), "account_id": aid, "status": status})
-        return []
-    except Exception:
-        log.exception("broker.list_orders.failed", extra={"account_id": aid, "status": status})
-        return []
+        ev = str((evt or {}).get("event") or (evt or {}).get("type") or "").lower()
+        o = (evt or {}).get("order") or {}
+        if not isinstance(o, dict):
+            o = {}
+        broker_id = o.get("id") or o.get("order_id") or (evt or {}).get("order_id")
+        client_id = o.get("client_order_id") or (evt or {}).get("client_order_id")
+        now = time.time()
 
-# ---------------------------------------------------------------------------
-# TradeRunner
-# ---------------------------------------------------------------------------
+        filled_avg = o.get("filled_avg_price") or o.get("avg_fill_price") or o.get("average_fill_price")
+        filled_qty = o.get("filled_qty") or o.get("filled_quantity") or (evt or {}).get("filled_qty") or (evt or {}).get("filled_quantity")
+        exec_px = (evt or {}).get("price") or (evt or {}).get("execution_price") or (evt or {}).get("fill_price")
 
-def _ensure_trade_runner() -> TradeRunner:
-    global _TRADE_RUNNER
-    if _TRADE_RUNNER is None:
-        _TRADE_RUNNER = TradeRunner(
-            pm=pm,
-            trades=_MANAGED_TRADES,
-            journal_append=_journal_append,
-            publish_event=publish_event,
-            list_orders_for_account_async=_broker_list_orders,  # ok: trade runner isn't UI-hot
-            snapshot_for_account=_snapshot_for_account,
-        )
-    return _TRADE_RUNNER
+        patch: Dict[str, Any] = {
+            "id": broker_id,
+            "client_order_id": client_id,
+            "symbol": o.get("symbol") or (evt or {}).get("symbol"),
+            "side": o.get("side") or (evt or {}).get("side"),
+            "qty": o.get("qty") or (evt or {}).get("qty"),
+            "status": o.get("status") or ev,
+        }
 
-# ---------------------------------------------------------------------------
-# Background: reconcile + orders cache refresh
-# ---------------------------------------------------------------------------
+        if ev in ("new", "accepted", "pending_new", "submitted", "open"):
+            patch["ack_ts"] = now
 
-POLL_SECS = float(os.getenv("TRADER_RECONCILE_INTERVAL", "10"))
-_ORDERS_REFRESH_SECS = float(os.getenv("TRADER_ORDERS_REFRESH_INTERVAL", "5"))
-
-_LAST_POLL_TS: float = 0.0
-_LAST_POLL_ERR: Optional[str] = None
-
-_LAST_ORDERS_SYNC_TS: float = 0.0
-_LAST_ORDERS_SYNC_ERR: Optional[str] = None
-
-def _last_poll_iso() -> Optional[str]:
-    if not _LAST_POLL_TS:
-        return None
-    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(_LAST_POLL_TS))
-
-def _last_orders_sync_iso() -> Optional[str]:
-    if not _LAST_ORDERS_SYNC_TS:
-        return None
-    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(_LAST_ORDERS_SYNC_TS))
-
-async def _background_reconciler():
-    global _LAST_POLL_TS, _LAST_POLL_ERR
-    while True:
-        base = max(3.0, min(POLL_SECS, 30.0))
-        jitter = random.uniform(-base * 0.1, base * 0.1)
-        sleep_for = max(3.0, min(base + jitter, 30.0))
-        try:
-            await asyncio.sleep(sleep_for)
-        except asyncio.CancelledError:
-            break
-
-        try:
-            fn = getattr(pm, "reconcile_once", None)
-            if fn is not None:
-                await _call_maybe_async(fn)
-            _LAST_POLL_TS = time.time()
-            _LAST_POLL_ERR = None
-        except Exception as e:
-            _LAST_POLL_TS = time.time()
-            _LAST_POLL_ERR = str(e)
-            log.exception("background_reconcile.failed")
-
-async def _refresh_orders_cache_once():
-    """
-    Pull broker orders in the background and merge into local ledger.
-    Never called from request handlers.
-    """
-    global _LAST_ORDERS_SYNC_TS, _LAST_ORDERS_SYNC_ERR
-    try:
-        # expire local ghosts before merge
-        _expire_stale_pending_locals()
-
-        for aid in list(pm.adapters.keys()):
-            # active orders
-            active = await _broker_list_orders(aid, "active")
-            for od in active:
-                _upsert_local_from_broker(aid, od)
-
-            # closed orders (best effort; may be empty depending on adapter)
-            closed = await _broker_list_orders(aid, "closed")
-            for od in closed:
-                _upsert_local_from_broker(aid, od)
-
-        _LAST_ORDERS_SYNC_TS = time.time()
-        _LAST_ORDERS_SYNC_ERR = None
-    except Exception as e:
-        _LAST_ORDERS_SYNC_TS = time.time()
-        _LAST_ORDERS_SYNC_ERR = str(e)
-        log.exception("orders_cache_refresh.failed")
-
-async def _background_orders_cache_refresh():
-    base = max(2.0, min(_ORDERS_REFRESH_SECS, 30.0))
-    while True:
-        try:
-            jitter = random.uniform(-base * 0.15, base * 0.15)
-            await asyncio.sleep(max(1.0, base + jitter))
-        except asyncio.CancelledError:
-            break
-        await _refresh_orders_cache_once()
-
-# ---------------------------------------------------------------------------
-# Phase 2 (minimal): Risk + Plan compilation (unchanged stubs)
-# ---------------------------------------------------------------------------
-
-def _risk_decision_v1(account_id: str, symbol: str, side: str, raw_intent: Dict[str, Any]) -> Dict[str, Any]:
-    src = str(raw_intent.get("source") or "bot").lower()
-    requested_shares = raw_intent.get("shares") or raw_intent.get("qty")
-    shares = 10
-    try:
-        if src == "manual" and requested_shares is not None:
-            shares = max(1, min(int(requested_shares), 1000))
-    except Exception:
-        shares = 10
-
-    max_total_risk_dollars = 50.0
-    return {
-        "ok": True,
-        "account_id": account_id,
-        "symbol": symbol,
-        "side": side,
-        "shares": shares,
-        "max_total_risk_$": max_total_risk_dollars,
-        "allow_addons": False,
-        "max_addons": 0,
-        "notes": "phase2 risk stub",
-    }
-
-def _compile_plan_v1(intent_doc: Dict[str, Any], risk: Dict[str, Any]) -> Dict[str, Any]:
-    trigger = intent_doc.get("trigger") or {"kind": "immediate"}
-    if isinstance(trigger, dict) and "type" in trigger and "kind" not in trigger:
-        trigger = {**trigger, "kind": trigger.get("type")}
-
-    entry_plan = {"kind": "entry", "style": "market", "trigger": trigger, "shares": risk.get("shares")}
-    exit_plan = {"kind": "exit", "hard_stop": {"mode": "computed_by_trade_runner"}, "soft_stop": {"mode": "disabled"}}
-    scale_plan = {"mode": "disabled", "tranches": [], "notes": "phase2"}
-    return {"version": 1, "entry": entry_plan, "exit": exit_plan, "scale": scale_plan}
-
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
-
-@app.get("/")
-async def root():
-    return {"ok": True, "service": "Reflex Trader API", "adapters": list(pm.adapters.keys()), "portfolio_accounts": list(pm.portfolio.keys())}
-
-@app.get("/v1/time")
-async def api_time():
-    now = datetime.now(timezone.utc)
-    return {
-        "ok": True,
-        "server_utc_ms": int(now.timestamp() * 1000),
-        "server_iso": now.isoformat().replace("+00:00", "Z"),
-        "source": "trader",
-        "stale": False,
-    }
-
-@app.get("/v1/events")
-async def stream_events(request: Request):
-    headers = {"Cache-Control": "no-cache", "Connection": "keep-alive"}
-    return _StreamingResponse(_sse_event_generator(request), media_type="text/event-stream", headers=headers)
-
-@app.get("/v1/portfolio/accounts")
-async def api_list_accounts():
-    return {"ok": True, "accounts": list(pm.adapters.keys())}
-
-@app.get("/v1/portfolio/snapshot")
-async def api_snapshot(account_id: Optional[str] = Query(None, alias="account_id")):
-    if account_id:
-        return {"ok": True, "snapshot": _snapshot_for_account(account_id)}
-    snaps = {aid: _snapshot_for_account(aid) for aid in pm.adapters.keys()}
-    return {"ok": True, "snapshots": snaps}
-
-@app.get("/v1/portfolio/overview")
-async def api_overview():
-    overview: Dict[str, Any] = {}
-    for aid, adapter in pm.adapters.items():
-        snap = _snapshot_for_account(aid)
-        balances = {"cash": snap["cash"], "equity": snap["equity"], "buying_power": snap["buying_power"], "updated_at": snap["updated_at"]}
-        positions = snap["positions"]
-        broker_id = getattr(adapter, "broker_id", None) or getattr(adapter, "broker", None)
-        kind = getattr(adapter, "kind", None) or getattr(adapter, "adapter_kind", None) or getattr(adapter, "name", None) or "unknown"
-        overview[aid] = {"balances": balances, "positions": positions, "broker_id": broker_id, "kind": kind}
-    return {"overview": overview, "count": len(overview), "live_only": False, "account_id": None}
-
-@app.get("/v1/portfolio/positions")
-async def api_positions(account_id: Optional[str] = Query(None, alias="account_id")):
-    # Cache-only: never broker I/O
-    positions: List[Dict[str, Any]] = []
-    if account_id:
-        positions.extend(_snapshot_for_account(account_id)["positions"])
-    else:
-        for aid in pm.adapters.keys():
-            positions.extend(_snapshot_for_account(aid)["positions"])
-    return {
-        "ok": True,
-        "positions": positions,
-        "stale": bool(_LAST_POLL_ERR),
-        "last_sync_at": _last_poll_iso(),
-        "last_sync_error": _LAST_POLL_ERR,
-    }
-
-@app.post("/v1/portfolio/reconcile")
-async def api_reconcile(request: Request):
-    try:
-        data = await request.json()
-    except Exception:
-        data = {}
-    aid = data.get("account_id")
-
-    try:
-        fn = getattr(pm, "reconcile_once", None)
-        if fn is None:
-            raise HTTPException(status_code=500, detail="PortfolioManager has no reconcile_once")
-        await _call_maybe_async(fn, account_id=aid)
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.exception("reconcile_once.failed", extra={"account_id": aid})
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-    # refresh orders cache after reconcile (best effort)
-    try:
-        await _refresh_orders_cache_once()
-    except Exception:
-        pass
-
-    if aid:
-        snapshot = _snapshot_for_account(aid)
-        return {"ok": True, "message": "reconciled", "accounts": [aid], "results": {aid: {"status": "ok", "snapshot": snapshot}}}
-
-    results: Dict[str, Any] = {k: {"status": "ok", "snapshot": _snapshot_for_account(k)} for k in pm.adapters.keys()}
-    return {"ok": True, "message": "reconciled", "accounts": list(pm.adapters.keys()), "results": results}
-
-@app.post("/v1/portfolio/flatten")
-async def api_flatten(request: Request):
-    try:
-        data = await request.json()
-    except Exception:
-        data = {}
-    aid = data.get("account_id")
-
-    publish_event({"type": "FLATTEN_REQUEST", "account_id": aid, "ts": time.time()})
-    try:
-        fn = getattr(pm, "flatten", None)
-        if fn is None:
-            raise HTTPException(status_code=500, detail="PortfolioManager has no flatten")
-        await _call_maybe_async(fn, account_id=aid)
-
-        # reconcile after flatten
-        fn2 = getattr(pm, "reconcile_account", None)
-        if aid and fn2 is not None:
-            await _call_maybe_async(fn2, aid)
-        else:
-            fn3 = getattr(pm, "reconcile_once", None)
-            if fn3 is not None:
-                await _call_maybe_async(fn3)
-
-        publish_event({"type": "FLATTEN_DONE", "account_id": aid, "ts": time.time()})
-
-        # refresh orders cache after flatten
-        try:
-            await _refresh_orders_cache_once()
-        except Exception:
-            pass
-
-        return {"ok": True, "account_id": aid}
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.exception("flatten.failed", extra={"account_id": aid})
-        publish_event({"type": "FLATTEN_FAILED", "account_id": aid, "error": str(e), "ts": time.time()})
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
-
-@app.get("/v1/orders")
-async def api_list_orders(
-    status: str = Query("active", alias="status"),
-    account_id: Optional[str] = Query(None, alias="account_id"),
-):
-    """
-    Cache-only orders listing.
-    NO broker calls. Ever.
-    """
-    status = str(status or "active").lower().strip()
-    if status not in ("active", "closed", "all"):
-        status = "active"
-
-    _expire_stale_pending_locals()
-
-    out: List[Dict[str, Any]] = []
-    for o in _LOCAL_ORDERS.values():
-        if account_id and o.get("account_id") != account_id:
-            continue
-        st = o.get("status")
-        if status == "active" and not _is_active_status(st):
-            continue
-        if status == "closed" and not _is_closed_status(st):
-            continue
-        out.append(_local_order_doc(o))
-
-    out.sort(key=lambda x: str(x.get("submitted_at") or ""), reverse=True)
-
-    stale = bool(_LAST_ORDERS_SYNC_ERR) or bool(_LAST_POLL_ERR)
-    return {
-        "ok": True,
-        "orders": out,
-        "stale": stale,
-        "orders_last_sync_at": _last_orders_sync_iso(),
-        "orders_last_sync_error": _LAST_ORDERS_SYNC_ERR,
-    }
-
-@app.post("/v1/orders")
-@app.post("/v1/orders/place")
-async def api_orders_place(request: Request):
-    try:
-        data = await request.json()
-    except Exception:
-        data = {}
-
-    aid = data.get("account_id")
-    if not aid:
-        if len(pm.adapters) == 1:
-            aid = next(iter(pm.adapters.keys()))
-        else:
-            return JSONResponse({"ok": False, "error": "account_id required when multiple accounts present"}, status_code=400)
-
-    if aid not in pm.adapters:
-        return JSONResponse({"ok": False, "error": "unknown account_id"}, status_code=404)
-
-    args = {
-        "symbol": data.get("symbol"),
-        "side": data.get("side"),
-        "qty": data.get("qty"),
-        "type": data.get("type", "market"),
-        "time_in_force": data.get("time_in_force", data.get("tif", "day")),
-        "limit_price": data.get("limit_price"),
-        "stop_price": data.get("stop_price"),
-        "trail": data.get("trail"),
-        "extended_hours": bool(data.get("extended_hours", False)),
-        "note": data.get("note") or "manual",
-    }
-
-    # Local echo
-    client_id = str(uuid4())
-    submitted_at = _iso_now()
-    note = args.get("note") or ""
-    if "cid=" not in note:
-        note = (note + "; " if note else "") + f"cid={client_id}"
-    args["note"] = note
-
-    local = {
-        "account_id": aid,
-        "id": client_id,
-        "symbol": args.get("symbol"),
-        "side": args.get("side"),
-        "qty": args.get("qty"),
-        "type": args.get("type"),
-        "time_in_force": args.get("time_in_force"),
-        "limit_price": args.get("limit_price"),
-        "stop_price": args.get("stop_price"),
-        "status": "pending_local",
-        "submitted_at": submitted_at,
-        "updated_at": submitted_at,
-        "source": "manual",
-        "note": note,
-    }
-    _LOCAL_ORDERS[client_id] = local
-    publish_event({"type": "ORDER_LOCAL_NEW", "ts": time.time(), "account_id": aid, "order": _local_order_doc(local)})
-
-    if not args["symbol"] or not args["side"] or not args["qty"]:
-        _fail_local(client_id, aid, "symbol, side, qty required")
-        return JSONResponse({"ok": False, "error": "symbol, side, qty required"}, status_code=400)
-
-    broker_args = dict(args)
-
-    pm_fn = getattr(pm, "place_order", None)
-    if pm_fn is not None:
-        try:
-            res = await _call_maybe_async(pm_fn, account_id=aid, **broker_args)
-            bid = _broker_id_from_result(res)
-            if bid:
-                _CLIENT_TO_BROKER[client_id] = bid
-                # merge broker snapshot if convertible
+        if ev in ("partial_fill", "fill"):
+            existing = _get_local_order_by_any_id(str(broker_id) if broker_id else None, str(client_id) if client_id else None) or {}
+            if existing.get("first_fill_ts") is None:
+                patch["first_fill_ts"] = now
                 try:
-                    od = _coerce_order_dict(res, aid) if (isinstance(res, dict) or hasattr(res, "to_dict")) else {"id": bid}
-                    od["id"] = bid
-                    _upsert_local_from_broker(aid, od)
+                    patch["first_fill_price"] = float(exec_px or filled_avg) if (exec_px or filled_avg) is not None else None
                 except Exception:
-                    pass
-            else:
-                # at least mark as submitted
-                o = _LOCAL_ORDERS.get(client_id)
-                if o and str(o.get("status") or "").lower() == "pending_local":
-                    o["status"] = "submitted"
-                    o["updated_at"] = _iso_now()
+                    patch["first_fill_price"] = None
 
-            # best-effort background refresh soon
+        if ev == "fill" or str((o.get("status") or "")).lower() == "filled":
+            patch["filled_ts"] = now
             try:
-                asyncio.create_task(_refresh_orders_cache_once())
+                if filled_avg is not None:
+                    patch["avg_fill_price"] = float(filled_avg)
+            except Exception:
+                pass
+            try:
+                if filled_qty is not None:
+                    patch["filled_qty"] = float(filled_qty)
             except Exception:
                 pass
 
-            return {"ok": True, "account_id": aid, "order": res}
-        except Exception as e:
-            _fail_local(client_id, aid, str(e))
-            return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+        _upsert_local_telemetry(account_id, str(broker_id) if broker_id else None, str(client_id) if client_id else None, patch)
 
-    # Fallback: adapter place_order/submit_order/create_order (run safely)
-    ad = pm.adapters[aid]
-    fn = getattr(ad, "place_order", None)
-    if fn is None:
-        for alt in ("submit_order", "create_order"):
-            alt_fn = getattr(ad, alt, None)
-            if alt_fn is not None:
-                fn = alt_fn
-                break
-
-    if fn is None:
-        _fail_local(client_id, aid, "adapter does not support place_order")
-        return JSONResponse({"ok": False, "error": "adapter does not support place_order"}, status_code=400)
-
-    try:
-        res = await _call_maybe_async(fn, **broker_args)
-        bid = _broker_id_from_result(res)
-        if bid:
-            _CLIENT_TO_BROKER[client_id] = bid
+        # Mirror into _MANAGED_TRADES
         try:
-            asyncio.create_task(_refresh_orders_cache_once())
+            cid = str(client_id or "")
+            if ":" in cid:
+                trade_id = cid.split(":", 1)[0]
+                t = _MANAGED_TRADES.get(trade_id)
+                if isinstance(t, dict):
+                    if ":entry" in cid:
+                        if "ack_ts" in patch:
+                            t["entry_ack_ts"] = patch["ack_ts"]
+                        if "first_fill_ts" in patch and t.get("entry_first_fill_ts") is None:
+                            t["entry_first_fill_ts"] = patch["first_fill_ts"]
+                            t["entry_first_fill_price"] = patch.get("first_fill_price")
+                        if "filled_ts" in patch:
+                            t["entry_filled_ts"] = patch["filled_ts"]
+                            if patch.get("avg_fill_price") is not None:
+                                t["entry_fill_price"] = patch.get("avg_fill_price")
+                    elif ":exit:" in cid:
+                        if "ack_ts" in patch:
+                            t["exit_ack_ts"] = patch["ack_ts"]
+                        if "first_fill_ts" in patch and t.get("exit_first_fill_ts") is None:
+                            t["exit_first_fill_ts"] = patch["first_fill_ts"]
+                            t["exit_first_fill_price"] = patch.get("first_fill_price")
+                        if "filled_ts" in patch:
+                            t["exit_filled_ts"] = patch["filled_ts"]
+                            t["exit_avg_fill_price"] = patch.get("avg_fill_price")
+                            t["exit_filled_qty"] = patch.get("filled_qty")
+                            if patch.get("avg_fill_price") is not None:
+                                t["exit_fill_price"] = patch.get("avg_fill_price")
         except Exception:
             pass
-        return {"ok": True, "account_id": aid, "order": res}
-    except Exception as e:
-        _fail_local(client_id, aid, str(e))
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
-
-@app.post("/v1/orders/cancel_all")
-async def api_orders_cancel_all(request: Request):
-    try:
-        data = await request.json()
     except Exception:
-        data = {}
-    aid = data.get("account_id")
-    if not aid:
-        if len(pm.adapters) == 1:
-            aid = next(iter(pm.adapters.keys()))
-        else:
-            return JSONResponse({"ok": False, "error": "account_id required"}, status_code=400)
+        return
 
-    if aid not in pm.adapters:
-        return JSONResponse({"ok": False, "error": "unknown account_id"}, status_code=404)
+# ---------------------------------------------------------------------------
+# Store / Alerts shims for TradeRunner
+# ---------------------------------------------------------------------------
 
-    publish_event({"type": "CANCEL_ALL_REQUEST", "account_id": aid, "ts": time.time()})
-    ad = pm.adapters[aid]
+class _StoreShim:
+    def get_active_trades(self) -> List[Dict[str, Any]]:
+        return list(_MANAGED_TRADES.values())
+    def get_md(self, symbol: str) -> Dict[str, Any]:
+        """
+        Return MD dict for TradeRunner: {"lt":..., "bid":..., "ask":...}
 
-    fn = getattr(ad, "cancel_all_orders", None) or getattr(ad, "cancel_all", None)
+        Priority:
+        1) PortfolioManager.get_md(symbol) if it exists (preferred)
+        2) md_worker Redis cache: key = TRADER_MD_KEY_PREFIX + ":" + SYMBOL
+            default prefix = reflex:{instance_id}:md
+        """
+        sym = str(symbol or "").upper().strip()
+        if not sym:
+            return {}
+
+        # 1) If pm has a live get_md implementation, use it.
+        try:
+            fn = getattr(pm, "get_md", None)
+            if fn is not None:
+                out = fn(sym) or {}
+                if isinstance(out, dict) and (out.get("lt") is not None or out.get("bid") is not None or out.get("ask") is not None):
+                    return out
+        except Exception:
+            pass
+
+        # 2) Fallback: read md_worker Redis key directly.
+        try:
+            import json as _json
+            import redis  # type: ignore
+
+            instance_id = (os.getenv("REFLEX_INSTANCE_ID") or os.getenv("INSTANCE") or "liveA").strip()
+            tpl = (os.getenv("TRADER_MD_KEY_PREFIX", "reflex:{instance_id}:md") or "reflex:{instance_id}:md").strip()
+            prefix = tpl.format(instance_id=instance_id).rstrip(":")
+            key = f"{prefix}:{sym}"
+
+            r = redis.Redis.from_url(get_redis_url(), decode_responses=True)
+            raw = r.get(key)
+            if not raw:
+                return {}
+
+            doc = _json.loads(raw)
+            # md_worker writes dataclass-as-dict: {"symbol","last_trade","last_quote","updated_ts"}
+            lt = None
+            bid = None
+            ask = None
+
+            try:
+                lt = doc.get("last_trade", {}).get("price")
+            except Exception:
+                lt = None
+            try:
+                bid = doc.get("last_quote", {}).get("bid")
+                ask = doc.get("last_quote", {}).get("ask")
+            except Exception:
+                bid = None
+                ask = None
+
+            out = {}
+            if lt is not None:
+                out["lt"] = float(lt)
+            if bid is not None:
+                out["bid"] = float(bid)
+            if ask is not None:
+                out["ask"] = float(ask)
+
+            # helpful freshness (optional)
+            if doc.get("updated_ts") is not None:
+                out["updated_ts"] = doc.get("updated_ts")
+
+            return out
+        except Exception:
+            return {}
+
+
+    def journal_append(self, kind: str, obj: Dict[str, Any]) -> None:
+        return
+
+class _AlertsShim:
+    def emit(self, event_type: str, **evt: Any) -> None:
+        return
+
+_STORE = _StoreShim()
+_ALERTS = _AlertsShim()
+
+
+# ---------------------------------------------------------------------------
+# Orders cache refresh (broker truth -> local echo)
+# ---------------------------------------------------------------------------
+
+async def _refresh_orders_cache_once() -> None:
+    """Pull broker orders (open+closed) and update _LOCAL_ORDERS statuses.
+
+    This prevents orders from getting stuck in SUBMITTED when fills occur.
+    We match broker orders by broker order id using _CLIENT_TO_BROKER mapping.
+    """
+    global _LAST_ORDERS_SYNC_TS, _LAST_ORDERS_SYNC_ERR
     try:
-        if fn is not None:
-            await _call_maybe_async(fn)
-        else:
-            # best effort: use broker list (background-safe)
-            open_orders = await _broker_list_orders(aid, status="active")
-            cancel_one = getattr(ad, "cancel_order", None) or getattr(ad, "cancel", None)
-            if cancel_one is None:
-                return JSONResponse({"ok": False, "error": "adapter has no cancel method"}, status_code=400)
-            for o in open_orders:
-                oid = o.get("id") or o.get("order_id")
-                if not oid:
+        rev: Dict[str, str] = {str(bid): str(cid) for cid, bid in _CLIENT_TO_BROKER.items() if bid}
+        updated = 0
+
+        for aid, ad in list(getattr(pm, "adapters", {}).items()):
+            # adapter must expose list_open_orders(status=...)
+            lister = getattr(ad, "list_open_orders", None)
+            if lister is None:
+                continue
+            for st in ("open", "closed"):
+                try:
+                    arr = await _call_maybe_async(lister, st)
+                except Exception:
+                    arr = []
+                if not isinstance(arr, list):
                     continue
-                await _call_maybe_async(cancel_one, oid)
+                for bo in arr:
+                    if not isinstance(bo, dict):
+                        continue
+                    bid = bo.get("id") or bo.get("order_id")
+                    if not bid:
+                        continue
+                    cid = rev.get(str(bid))
+                    if not cid:
+                        continue
+                    lo = _LOCAL_ORDERS.get(cid)
+                    if not lo:
+                        continue
+                    # update fields we commonly display
+                    lo["broker_order_id"] = str(bid)
+                    if bo.get("status"):
+                        lo["status"] = str(bo.get("status"))
+                    if bo.get("filled_qty") is not None:
+                        lo["filled_qty"] = bo.get("filled_qty")
+                    if bo.get("filled_avg_price") is not None:
+                        lo["filled_avg_price"] = bo.get("filled_avg_price")
+                    if bo.get("submitted_at") is not None:
+                        lo.setdefault("submitted_at", bo.get("submitted_at"))
+                    lo["updated_at"] = _iso_now()
+                    updated += 1
 
-        fn2 = getattr(pm, "reconcile_account", None)
-        if fn2 is not None:
-            await _call_maybe_async(fn2, aid)
+        _LAST_ORDERS_SYNC_TS = time.time()
+        _LAST_ORDERS_SYNC_ERR = None
+        if updated:
+            log.info("orders.sync.updated", extra={"updated": updated})
+    except Exception as e:
+        _LAST_ORDERS_SYNC_TS = time.time()
+        _LAST_ORDERS_SYNC_ERR = str(e)
+        log.exception("orders.sync.failed")
 
-        publish_event({"type": "CANCEL_ALL_DONE", "account_id": aid, "ts": time.time()})
+
+async def _background_orders_cache_refresh() -> None:
+    while True:
         try:
             await _refresh_orders_cache_once()
         except Exception:
             pass
-        return {"ok": True, "account_id": aid}
-    except Exception as e:
-        publish_event({"type": "CANCEL_ALL_FAILED", "account_id": aid, "error": str(e), "ts": time.time()})
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
-
+        await asyncio.sleep(float(os.getenv("TRADER_ORDERS_SYNC_SECS", "2") or 2))
 
 # ---------------------------------------------------------------------------
-# BrokerView endpoint aliases (contract compatibility)
-# ---------------------------------------------------------------------------
-# BrokerView calls these:
-#   POST /v1/accounts/flatten
-#   POST /v1/accounts/cancel_all
-# In Trader v2.1.0 the canonical implementations are:
-#   POST /v1/portfolio/flatten
-#   POST /v1/orders/cancel_all
-# These aliases keep UI buttons working without changing BrokerView.
-
-@app.post("/v1/accounts/flatten")
-async def api_accounts_flatten(request: Request):
-    # Delegate to canonical endpoint implementation
-    return await api_flatten(request)
-
-@app.post("/v1/accounts/cancel_all")
-async def api_accounts_cancel_all(request: Request):
-    # Delegate to canonical endpoint implementation
-    return await api_orders_cancel_all(request)
-
-
-@app.get("/v1/intents")
-async def api_list_intents(limit: int = Query(50, alias="limit")):
-    print("Listing intents with limit:", limit)
-    _journal_sync_if_needed()
-    try:
-        n = max(1, min(int(limit or 50), 500))
-    except Exception:
-        n = 50
-    items = list(_INTENT_HISTORY)[-n:]
-    items.reverse()
-    return {"ok": True, "intents": items}
-
-@app.post("/v1/intents")
-async def api_submit_intent(request: Request):
-    try:
-        data = await request.json()
-    except Exception:
-        data = {}
-
-    account_id = (data.get("account_id") or "").strip() or None
-    if not account_id:
-        account_id = _default_account_id()
-    if not account_id:
-        raise HTTPException(status_code=400, detail="account_id required (multiple accounts configured)")
-    if account_id not in pm.adapters:
-        raise HTTPException(status_code=404, detail="unknown account_id")
-
-    symbol = str(data.get("symbol", "")).upper().strip()
-    if not symbol:
-        raise HTTPException(status_code=400, detail="symbol required")
-
-    side = str(data.get("side", "buy")).lower().strip() or "buy"
-    if side not in ("buy", "sell", "short", "cover"):
-        raise HTTPException(status_code=400, detail="invalid side")
-
-    source = str(data.get("source", "bot")).lower().strip() or "bot"
-    if source not in ("bot", "manual"):
-        source = "bot"
-
-    strategy_id = str(data.get("strategy_id", "")).strip() or None
-    trigger = data.get("trigger") or {"kind": "immediate"}
-
-    intent_id = _new_intent_id()
-    trade_id = _new_trade_id()
-    now = time.time()
-
-    print(f"Submitting intent {intent_id} for trade {trade_id} on account {account_id} for symbol {symbol} with side {side}")
-    intent_doc: Dict[str, Any] = {
-        "intent_id": intent_id,
-        "trade_id": trade_id,
-        "created_ts": now,
-        "account_id": account_id,
-        "symbol": symbol,
-        "side": side,
-        "source": source,
-        "strategy_id": strategy_id,
-        "trigger": trigger,
-        "raw": data,
-    }
-    _INTENT_HISTORY.append(intent_doc)
-    _journal_append("intent", intent_doc)
-
-    risk = _risk_decision_v1(account_id, symbol, side, data)
-    plan = _compile_plan_v1(intent_doc, risk)
-
-    trade_doc: Dict[str, Any] = {
-        "trade_id": trade_id,
-        "intent_id": intent_id,
-        "created_ts": now,
-        "account_id": account_id,
-        "symbol": symbol,
-        "side": side,
-        "state": "READY",
-        "strategy_id": strategy_id,
-        "trigger": trigger,
-        "source": source,
-        "note": data.get("note") or "",
-        "risk": risk,
-        "plan": plan,
-        "qty": float(risk.get("shares") or 0),
-    }
-    _MANAGED_TRADES[trade_id] = trade_doc
-    _journal_append("trade", trade_doc)
-
-    try:
-        _ensure_trade_runner().enqueue(trade_id)
-    except Exception:
-        pass
-
-    publish_event({"type": "INTENT_ACCEPTED", "ts": now, "account_id": account_id, "symbol": symbol, "trade_id": trade_id,
-                   "intent_id": intent_id, "source": source, "strategy_id": strategy_id, "state": "READY"})
-    publish_event({"type": "TRADE_READY", "ts": now, "account_id": account_id, "symbol": symbol, "trade_id": trade_id,
-                   "intent_id": intent_id, "risk": {"shares": risk.get("shares"), "max_total_risk_$": risk.get("max_total_risk_$")},
-                   "plan": {"entry": plan.get("entry"), "exit": plan.get("exit")}})
-
-    return {"ok": True, "intent": intent_doc, "trade": trade_doc}
-
-@app.get("/v1/trades")
-async def api_list_trades(status: str = Query("planned", alias="status"), account_id: Optional[str] = Query(None, alias="account_id")):
-    _journal_sync_if_needed()
-    if status not in ("planned", "active", "closed"):
-        status = "planned"
-
-    planned_states = {"READY"}
-    active_states = {"ENTRY_SUBMITTED", "ENTRY_FILLED", "PROTECT_SUBMITTED", "PROTECTED"}
-    closed_states = {"DONE", "CANCELED", "ERROR", "REJECTED", "ABORT_PROTECTION"}
-
-    out: List[Dict[str, Any]] = []
-    for t in _MANAGED_TRADES.values():
-        if account_id and t.get("account_id") != account_id:
-            continue
-        st = str(t.get("state") or "")
-        if status == "planned" and st in planned_states:
-            out.append(t)
-        elif status == "active" and st in active_states:
-            out.append(t)
-        elif status == "closed" and st in closed_states:
-            out.append(t)
-
-    out.sort(key=lambda x: float(x.get("created_ts") or 0), reverse=True)
-    return {"ok": True, "trades": out}
-
-@app.get("/v1/trades/{trade_id}")
-async def api_get_trade(trade_id: str):
-    _journal_sync_if_needed()
-    t = _MANAGED_TRADES.get(trade_id)
-    if not t:
-        raise HTTPException(status_code=404, detail="trade not found")
-    return {"ok": True, "trade": t}
-
-@app.get("/v1/health")
-async def api_health():
-    return {
-        "ok": True,
-        "adapters": list(pm.adapters.keys()),
-        "portfolio_accounts": list(pm.portfolio.keys()),
-        "last_snapshot_count": len(pm.portfolio or {}),
-        "poll_seconds": POLL_SECS,
-        "last_poll_at": _last_poll_iso(),
-        "last_poll_error": _LAST_POLL_ERR,
-        "orders_refresh_seconds": _ORDERS_REFRESH_SECS,
-        "orders_last_sync_at": _last_orders_sync_iso(),
-        "orders_last_sync_error": _LAST_ORDERS_SYNC_ERR,
-    }
-
-# ---------------------------------------------------------------------------
-# Broker WS events (Alpaca) – best effort; never blocks the loop
+# Background tasks
 # ---------------------------------------------------------------------------
 
-async def _background_broker_events():
-    global _bg_events_stop, _bg_events_tasks
-    _bg_events_stop = asyncio.Event()
-    loop = asyncio.get_running_loop()
+_TRADE_RUNNER: Optional[TradeRunner] = None
+_bg_orders_task: Optional[asyncio.Task] = None
+_bg_reconcile_task: Optional[asyncio.Task] = None
+_bg_events_stop = asyncio.Event()
+_MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
-    tasks: List[asyncio.Task] = []
-    for aid, ad in pm.adapters.items():
+async def _background_reconcile(loop: asyncio.AbstractEventLoop):
+    while True:
         try:
-            if getattr(ad, "broker_id", "") != "alpaca":
+            for aid in list(getattr(pm, "adapters", {}).keys()):
+                fn = getattr(pm, "reconcile_account", None)
+                if fn is not None:
+                    await _call_maybe_async(fn, aid)
+        except Exception:
+            pass
+        await asyncio.sleep(float(os.getenv("TRADER_RECONCILE_SECS", "5") or 5))
+
+async def _background_broker_events(loop: asyncio.AbstractEventLoop):
+    tasks: List[asyncio.Task] = []
+    for aid, a in list(getattr(pm, "adapters", {}).items()):
+        try:
+            if getattr(a, "broker_id", "") != "alpaca":
                 continue
-            base = getattr(ad, "base", "") or ""
-            key_id = getattr(ad, "key_id", "") or ""
-            secret = getattr(ad, "secret", "") or ""
+
+            base = getattr(a, "base", None) or os.getenv("ALPACA_BASE_URL") or "https://paper-api.alpaca.markets"
+            key_id = getattr(a, "key_id", None) or os.getenv("ALPACA_API_KEY_ID") or os.getenv("ALPACA_API_KEY") or ""
+            secret = getattr(a, "secret", None) or os.getenv("ALPACA_API_SECRET_KEY") or os.getenv("ALPACA_API_SECRET") or ""
             if not key_id or not secret:
                 continue
 
             def _on_evt_factory(account_id: str):
                 def _on_evt(evt: Dict[str, Any]) -> None:
+                    _apply_trade_update_telemetry(account_id, evt)
                     try:
-                        publish_event({"type": "BROKER_UPDATE", "ts": time.time(), "account_id": account_id, "event": evt})
-                    except Exception:
-                        pass
-                    try:
-                        pm.record_broker_event(account_id, evt)
+                        # record event for UI/debug if supported
+                        rec = getattr(pm, "record_broker_event", None)
+                        if rec is not None:
+                            loop.call_soon_threadsafe(
+                                asyncio.create_task,
+                                _call_maybe_async(rec, account_id, evt),
+                            )
+
+                        # immediate reconcile on broker updates
+                        rec_acc = getattr(pm, "reconcile_account", None)
+                        if rec_acc is not None:
+                            loop.call_soon_threadsafe(
+                                asyncio.create_task,
+                                _call_maybe_async(rec_acc, account_id),
+                            )
+
+                        # refresh orders cache so statuses advance (SUBMITTED->FILLED)
+                        loop.call_soon_threadsafe(
+                            asyncio.create_task,
+                            _refresh_orders_cache_once(),
+                        )
                     except Exception:
                         pass
 
-                    # Trigger cache refresh without blocking caller thread
-                    try:
-                        asyncio.run_coroutine_threadsafe(_refresh_orders_cache_once(), loop)
-                    except Exception:
-                        pass
-
-                    # Trigger reconcile without blocking caller thread
-                    try:
-                        fn = getattr(pm, "reconcile_account", None)
-                        if fn is not None:
-                            asyncio.run_coroutine_threadsafe(_call_maybe_async(fn, account_id), loop)
-                    except Exception:
-                        pass
                 return _on_evt
 
             tasks.append(
@@ -1382,82 +724,547 @@ async def _background_broker_events():
         except Exception:
             log.exception("broker_events.task_create.failed", extra={"account_id": aid})
 
-    _bg_events_tasks = tasks
     if tasks:
         try:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
             pass
 
-# ---------------------------------------------------------------------------
-# Startup / Shutdown
-# ---------------------------------------------------------------------------
 
+def _ensure_trade_runner() -> TradeRunner:
+    global _TRADE_RUNNER
+    if _TRADE_RUNNER is None:
+        _TRADE_RUNNER = TradeRunner(
+            store=_STORE,
+            alerts=_ALERTS,
+            adapters=getattr(pm, "adapters", {}),
+            portfolio_manager=pm,
+        )
+    return _TRADE_RUNNER
+
+async def _background_trade_runner(loop: asyncio.AbstractEventLoop):
+    tr = _ensure_trade_runner()
+    await tr.run_forever()
+@app.get("/v1/debug/routes")
+async def debug_routes():
+    """List registered routes so we can confirm the running process has our debug endpoints."""
+    out = []
+    try:
+        for r in app.routes:
+            methods = sorted(list(getattr(r, "methods", []) or []))
+            path = getattr(r, "path", None)
+            name = getattr(r, "name", None)
+            if path:
+                out.append({"path": path, "methods": methods, "name": name})
+    except Exception:
+        pass
+    out.sort(key=lambda x: x["path"])
+    return {"items": out}
+@app.get("/v1/debug/md")
+async def debug_md(symbol: str = Query(...)):
+    """
+    Show exactly what key Trader reads for md_worker cache and the raw JSON stored there.
+    This isolates: redis_url / instance_id / key_prefix mismatches.
+    """
+    sym = str(symbol or "").upper().strip()
+    if not sym:
+        raise HTTPException(status_code=400, detail="symbol required")
+
+    # The exact same prefix logic used in your get_md() fallback
+    instance_id = (os.getenv("REFLEX_INSTANCE_ID") or os.getenv("INSTANCE") or "liveA").strip()
+    tpl = (os.getenv("TRADER_MD_KEY_PREFIX", "reflex:{instance_id}:md") or "reflex:{instance_id}:md").strip()
+    prefix = tpl.format(instance_id=instance_id).rstrip(":")
+    key = f"{prefix}:{sym}"
+
+    redis_url = (os.getenv("REDIS_URL") or os.getenv("REFLEX_REDIS_URL") or "redis://127.0.0.1:6379/0").strip()
+
+    raw = None
+    err = None
+    doc = None
+    ttl = None
+    try:
+        import redis  # type: ignore
+        r = redis.Redis.from_url(redis_url, decode_responses=True)
+        raw = r.get(key)
+        ttl = r.ttl(key)
+        if raw:
+            import json as _json
+            doc = _json.loads(raw)
+    except Exception as e:
+        err = str(e)
+
+    # Also show what store.get_md returns right now
+    store = _StoreShim()
+    md = store.get_md(sym) or {}
+
+    return {
+        "symbol": sym,
+        "redis_url": redis_url,
+        "instance_id": instance_id,
+        "key_prefix": prefix,
+        "key": key,
+        "ttl": ttl,
+        "raw": raw,
+        "doc": doc,
+        "store_get_md": md,
+        "error": err,
+    }
+
+@app.get("/v1/debug/exit_eval")
+async def debug_exit_eval(
+    account_id: Optional[str] = Query(None),
+    trade_id: Optional[str] = Query(None),
+    symbol: Optional[str] = Query(None),
+):
+    """
+    Debug endpoint: show the exact price inputs TradeRunner uses (lt/bid/ask),
+    the derived last_px (lt->bid->ask), and whether stop/target would trigger.
+
+    Uses the same store.get_md() path TradeRunner uses, so this verifies the
+    DataHub tick/quote feed wiring end-to-end.
+    """
+    def _as_float(x):
+        try:
+            if x is None:
+                return None
+            if isinstance(x, bool):
+                return None
+            return float(x)
+        except Exception:
+            return None
+
+    store = _StoreShim()
+
+    out = []
+    for t in list(_MANAGED_TRADES.values()):
+        if not isinstance(t, dict):
+            continue
+
+        if account_id and str(t.get("account_id") or "") != str(account_id):
+            continue
+        if trade_id and str(t.get("trade_id") or "") != str(trade_id):
+            continue
+        if symbol and str(t.get("symbol") or "").upper() != str(symbol).upper():
+            continue
+
+        st = str(t.get("state") or "").upper()
+        if st in ("DONE", "ERROR"):
+            continue
+
+        sym = str(t.get("symbol") or "").upper()
+        md = store.get_md(sym) or {}
+
+        lt = _as_float(md.get("lt") or md.get("last") or md.get("price"))
+        bid = _as_float(md.get("bid"))
+        ask = _as_float(md.get("ask"))
+        last_px = lt if lt is not None else (bid if bid is not None else ask)
+
+        side = str(t.get("side") or "buy").lower()
+        kind = "short" if side in ("sell", "short") else "long"
+
+        stop_px = _as_float(t.get("soft_stop_price") or t.get("stop_price"))
+        target_px = _as_float(t.get("soft_target_price") or t.get("take_profit_price") or t.get("target_price"))
+        entry_px = _as_float(t.get("entry_avg_price"))
+
+        hit_stop = False
+        hit_target = False
+        if last_px is not None and stop_px is not None and target_px is not None:
+            if kind == "long":
+                hit_stop = (stop_px > 0) and (last_px <= stop_px)
+                hit_target = (target_px > 0) and (last_px >= target_px)
+            else:
+                hit_stop = (stop_px > 0) and (last_px >= stop_px)
+                hit_target = (target_px > 0) and (last_px <= target_px)
+
+        out.append(
+            {
+                "trade_id": t.get("trade_id"),
+                "account_id": t.get("account_id"),
+                "symbol": sym,
+                "state": st,
+                "kind": kind,
+                "entry_avg_price": entry_px,
+                "stop_px": stop_px,
+                "target_px": target_px,
+                "md": {"lt": lt, "bid": bid, "ask": ask, "updated_ts": md.get("updated_ts")},
+                "last_px_used_by_trader": last_px,
+                "hit_stop": hit_stop,
+                "hit_target": hit_target,
+            }
+        )
+
+    # Most relevant first: trades where we *think* it should hit
+    out.sort(key=lambda x: (x["hit_stop"] or x["hit_target"], x.get("symbol") or ""), reverse=True)
+    return {"items": out}
 @app.on_event("startup")
 async def on_startup():
     global _MAIN_LOOP, _bg_reconcile_task, _bg_orders_task
     log.info("startup.begin")
-    _MAIN_LOOP = asyncio.get_running_loop()
-
-    # register adapters
-    fn_reg = getattr(pm, "register_from_db", None)
-    if fn_reg is None:
-        raise RuntimeError("PortfolioManager missing register_from_db")
-    await _call_maybe_async(fn_reg)
-
-    # initial reconcile
-    try:
-        fn_rec = getattr(pm, "reconcile_once", None)
-        if fn_rec is not None:
-            await _call_maybe_async(fn_rec)
-    except Exception:
-        log.exception("startup.initial_reconcile.failed")
-
-    # initial orders refresh (best effort)
-    try:
-        await _refresh_orders_cache_once()
-    except Exception:
-        pass
-
-    # background loops
     loop = asyncio.get_event_loop()
-    _bg_reconcile_task = loop.create_task(_background_reconciler())
-    _bg_orders_task = loop.create_task(_background_orders_cache_refresh())
-    loop.create_task(_background_broker_events())
+    _MAIN_LOOP = loop
 
-    _ensure_trade_runner().start()
+    # IMPORTANT: register adapters before starting background loops.
+    # If this is skipped, BrokerView has no accounts and polling yields nonsense.
+    await _register_adapters_once()
+
+    # Prime an initial snapshot so UI isn't blank for the first poll cycle.
+    try:
+        fn = getattr(pm, "reconcile_once", None)
+        if fn is not None:
+            await fn()
+    except Exception:
+        log.exception("startup.reconcile_once.failed")
+
+    _bg_reconcile_task = asyncio.create_task(_background_reconcile(loop))
+    _bg_orders_task = asyncio.create_task(_background_orders_cache_refresh())
+    asyncio.create_task(_background_broker_events(loop))
+    asyncio.create_task(_background_trade_runner(loop))
     log.info("startup.done")
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    global _bg_reconcile_task, _bg_orders_task, _bg_events_tasks, _bg_events_stop, _TRADE_RUNNER
-    log.info("shutdown.begin")
-
     try:
-        if _bg_events_stop is not None:
-            _bg_events_stop.set()
+        _bg_events_stop.set()
+    except Exception:
+        pass
+    try:
+        if _bg_reconcile_task:
+            _bg_reconcile_task.cancel()
     except Exception:
         pass
 
-    for t in (_bg_reconcile_task, _bg_orders_task):
-        if t:
+# ---------------------------------------------------------------------------
+# API Endpoints (compat with BrokerView)
+# ---------------------------------------------------------------------------
+
+@app.get("/v1/health")
+async def health():
+    return {"ok": True, "ts": time.time(), "iso_utc": _iso_now()}
+
+@app.get("/v1/time")
+async def time_now():
+    return {"ts": time.time(), "iso_utc": _iso_now()}
+
+
+@app.get("/v1/events")
+async def events(limit: int = Query(200, ge=1, le=1000)):
+    """
+    BrokerView compatibility endpoint.
+
+    Returns recent trader-side events (cache). If no event plumbing is enabled yet,
+    this safely returns an empty list.
+    """
+    try:
+        # PortfolioManager keeps a small ring-buffer per account; expose aggregated view.
+        items = []
+        try:
+            pm_events = getattr(pm, "_events", {}) or {}
+            for aid, dq in pm_events.items():
+                for ev in (dq or []):
+                    if isinstance(ev, dict):
+                        items.append({"account_id": aid, **ev})
+        except Exception:
+            pass
+
+        # Intent history (if present)
+        try:
+            for ev in list(_INTENT_HISTORY)[-limit:]:
+                if isinstance(ev, dict):
+                    items.append(ev)
+        except Exception:
+            pass
+
+        # newest-first
+        items = items[-limit:]
+        return {"items": items}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v1/accounts")
+async def accounts():
+    """
+    BrokerView expects this. Return lightweight overview for all accounts.
+    """
+    try:
+        state = pm.get_state() or {}
+        accs = state.get("accounts") or {}
+
+        # PortfolioManager returns a dict keyed by account_id. BrokerView expects
+        # a list of account objects.
+        if isinstance(accs, dict):
+            items = list(accs.values())
+        elif isinstance(accs, list):
+            items = accs
+        else:
+            items = []
+
+        enriched: list[dict] = []
+        for it in items:
             try:
-                t.cancel()
-                try:
-                    await t
-                except asyncio.CancelledError:
-                    pass
+                if isinstance(it, dict):
+                    aid = it.get("account_id") or ""
+                    broker_id = (aid.split(":", 1)[0] if ":" in aid else "")
+                    d = dict(it)
+                    if broker_id:
+                        d.setdefault("broker_id", broker_id)
+                    d.setdefault("label", aid)
+                    enriched.append(d)
+                else:
+                    enriched.append(it)
             except Exception:
-                pass
-    _bg_reconcile_task = None
-    _bg_orders_task = None
+                enriched.append(it)
+
+        return {"items": enriched}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/v1/portfolio/overview")
+async def portfolio_overview():
+    """
+    BrokerView expects this endpoint.
+    Keep it cache-only: use PortfolioManager state/snapshots.
+    """
+    try:
+        return pm.get_state()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+@app.get("/v1/portfolio/positions")
+async def portfolio_positions(account_id: str = Query(...)):
+    """
+    BrokerView expects this endpoint.
+
+    Cache-only, but we enrich positions with Trader-managed "virtual" stop/target
+    so the Positions box can display soft protection even when no broker orders exist.
+    """
+    try:
+        snaps = pm.get_snapshots()
+        snap = snaps.get(account_id) or {}
+        positions = snap.get("positions") or []
+
+        # Build quick lookup of active managed trades by symbol for this account
+        active_by_sym: Dict[str, Dict[str, Any]] = {}
+        try:
+            for t in list(_MANAGED_TRADES.values()):
+                if not isinstance(t, dict):
+                    continue
+                if str(t.get("account_id") or "") != str(account_id):
+                    continue
+                st = str(t.get("state") or "").upper()
+                if st in ("DONE", "ERROR"):
+                    continue
+                sym = str(t.get("symbol") or "").upper()
+                if sym:
+                    active_by_sym[sym] = t
+        except Exception:
+            active_by_sym = {}
+
+        out: List[Dict[str, Any]] = []
+        for p in positions:
+            if not isinstance(p, dict):
+                continue
+
+            d = dict(p)
+            sym = str(d.get("symbol") or "").upper()
+            t = active_by_sym.get(sym)
+
+            if isinstance(t, dict):
+                # "Virtual orders" for UI
+                d["trade_id"] = t.get("trade_id")
+                d["trade_state"] = t.get("state")
+
+                # Prefer explicit compat fields, fall back to soft fields
+                stop_px = t.get("stop_price") or t.get("soft_stop_price")
+                tp_px = t.get("take_profit_price") or t.get("soft_target_price")
+
+                # Common field names UIs might look for
+                d["stop_price"] = stop_px
+                d["take_profit_price"] = tp_px
+                d["target_price"] = tp_px
+
+                # Keep originals too (handy for debug)
+                d["soft_stop_price"] = t.get("soft_stop_price")
+                d["soft_target_price"] = t.get("soft_target_price")
+
+                # Helpful for display
+                if t.get("entry_avg_price") is not None:
+                    d["avg_price"] = d.get("avg_price") or t.get("entry_avg_price")
+                    d["avg_entry_price"] = d.get("avg_entry_price") or t.get("entry_avg_price")
+
+            out.append(d)
+
+        return {"items": out, "account_id": account_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+@app.get("/v1/orders")
+async def get_orders(
+    account_id: Optional[str] = Query(None),
+    status: Optional[str] = Query("active"),
+    limit: int = Query(200, ge=1, le=2000),
+):
+    try:
+        docs = []
+        for o in list(_LOCAL_ORDERS.values()):
+            if account_id and o.get("account_id") != account_id:
+                continue
+            st = str(o.get("status") or "")
+            if (status or "active") == "active":
+                if not _is_active_status(st):
+                    continue
+            elif (status or "") == "closed":
+                if not _is_closed_status(st):
+                    continue
+            docs.append(_local_order_doc(o))
+        docs.sort(key=lambda x: str(x.get("updated_at") or ""), reverse=True)
+        return {"items": docs[: int(limit)], "stale": False}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+@app.post("/v1/orders")
+@app.post("/v1/orders/place")
+async def api_orders_place(request: Request):
+    """
+    Place an order via the account adapter.
+
+    Required by BrokerView. Performs a local echo into _LOCAL_ORDERS and then
+    calls the adapter's place_order (or submit/create).
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+
+    aid = (data.get("account_id") or "").strip() or None
+    if not aid:
+        aid = _default_account_id()
+    if not aid:
+        return JSONResponse({"ok": False, "error": "account_id required (multiple accounts present)"}, status_code=400)
+
+    if aid not in pm.adapters:
+        return JSONResponse({"ok": False, "error": "unknown account_id"}, status_code=404)
+
+    args = {
+        "symbol": data.get("symbol"),
+        "side": data.get("side"),
+        "qty": data.get("qty"),
+        "type": data.get("type", "market"),
+        "time_in_force": data.get("time_in_force", data.get("tif", "day")),
+        "limit_price": data.get("limit_price"),
+        "stop_price": data.get("stop_price"),
+        "trail": data.get("trail"),
+        "extended_hours": bool(data.get("extended_hours", False)),
+        "note": data.get("note") or "manual",
+        "client_order_id": data.get("client_order_id"),
+    }
+
+    client_id = str(uuid4())
+    submitted_at = _iso_now()
+
+    # Ensure broker and local echo share the same client_order_id for reconciliation
+    args["client_order_id"] = client_id
+
+    note = str(args.get("note") or "")
+    if "cid=" not in note:
+        note = (note + "; " if note else "") + f"cid={client_id}"
+    args["note"] = note
+
+    local = {
+        "account_id": aid,
+        "id": client_id,
+        "client_order_id": client_id,
+        "symbol": args.get("symbol"),
+        "side": args.get("side"),
+        "qty": args.get("qty"),
+        "type": args.get("type"),
+        "time_in_force": args.get("time_in_force"),
+        "limit_price": args.get("limit_price"),
+        "stop_price": args.get("stop_price"),
+        "status": "pending_local",
+        "submitted_at": submitted_at,
+        "updated_at": submitted_at,
+        "source": "local",
+        "note": note,
+    }
+    _LOCAL_ORDERS[client_id] = local
+
+    if not args["symbol"] or not args["side"] or not args["qty"]:
+        _fail_local(client_id, aid, "symbol, side, qty required")
+        return JSONResponse({"ok": False, "error": "symbol, side, qty required"}, status_code=400)
+
+    ad = pm.adapters[aid]
+    fn = getattr(ad, "place_order", None)
+    if fn is None:
+        for alt in ("submit_order", "create_order", "submit"):
+            alt_fn = getattr(ad, alt, None)
+            if alt_fn is not None:
+                fn = alt_fn
+                break
+
+    if fn is None:
+        _fail_local(client_id, aid, "adapter does not support place_order")
+        return JSONResponse({"ok": False, "error": "adapter does not support place_order"}, status_code=400)
 
     try:
-        if _TRADE_RUNNER is not None:
-            await _TRADE_RUNNER.stop()
-    except Exception:
-        pass
+        res = await _call_maybe_async(fn, **args)
+        bid = _broker_id_from_result(res)
+        if bid:
+            _CLIENT_TO_BROKER[client_id] = str(bid)
+            o = _LOCAL_ORDERS.get(client_id)
+            if o:
+                o["status"] = "submitted"
+                o["broker_order_id"] = str(bid)
+                o["updated_at"] = _iso_now()
+        return {"ok": True, "account_id": aid, "client_order_id": client_id, "order": res}
+    except Exception as e:
+        _fail_local(client_id, aid, str(e))
+        return JSONResponse({"ok": False, "error": str(e), "client_order_id": client_id}, status_code=400)
 
-    _bg_events_tasks = []
-    _bg_events_stop = None
-    log.info("shutdown.done")
+
+@app.post("/v1/orders/cancel_all")
+async def api_orders_cancel_all(request: Request):
+    """
+    Best-effort cancel all open orders for an account.
+    Requires adapter support (cancel_all_orders/cancel_all).
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    aid = (data.get("account_id") or "").strip() or None
+    if not aid:
+        aid = _default_account_id()
+    if not aid:
+        return JSONResponse({"ok": False, "error": "account_id required (multiple accounts present)"}, status_code=400)
+    if aid not in pm.adapters:
+        return JSONResponse({"ok": False, "error": "unknown account_id"}, status_code=404)
+
+    ad = pm.adapters[aid]
+    fn = getattr(ad, "cancel_all_orders", None) or getattr(ad, "cancel_all", None)
+    if fn is None:
+        return JSONResponse({"ok": False, "error": "adapter does not support cancel_all"}, status_code=400)
+
+    try:
+        res = await _call_maybe_async(fn)
+        return {"ok": True, "account_id": aid, "result": res}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+
+@app.post("/v1/accounts/cancel_all")
+async def api_accounts_cancel_all(request: Request):
+    return await api_orders_cancel_all(request)
+
+
+@app.get("/v1/portfolio")
+async def portfolio_state():
+    # Keep your newer endpoint too.
+    try:
+        return pm.get_state()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

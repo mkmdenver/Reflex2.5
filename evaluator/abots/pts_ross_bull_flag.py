@@ -1,5 +1,4 @@
-"""
-pts_ross_bull_flag.py
+"""pts_ross_bull_flag.py
 
 Historical forward-shape evaluator for a Ross-Cameron-style bull flag.
 
@@ -26,6 +25,11 @@ Env used (no double-underscore names; aligned with project .env):
     PARQUET_ROOT                 : fallback parquet root
     REFLEX_INSTANCE_ID           : instance name (optional, for logging only)
     REFLEX_RUN_ID                : run id tag (optional, default 'ross_bull_flag_dev')
+
+Notes (2026-01):
+- Added "core shape" trade metrics (TTS / early MAE / time underwater / TFP / CLUT / RPM, etc.).
+- No time buckets here: we emit raw per-event metrics into pattern_feature_record JSON.
+- 10-minute horizon is treated as a hard timeout (forced exit) for trade-like stats.
 """
 
 from __future__ import annotations
@@ -38,7 +42,7 @@ import sys
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, List, Sequence
+from typing import Iterable, List, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -50,15 +54,49 @@ import psycopg
 # ------------------------------------------------------------
 
 def get_run_id() -> str:
-    """Run id for pattern rows, with sane defaults."""
-    return (
+    """
+    Run id for pattern rows.
+
+    Behavior:
+      - If REFLEX_RUN_ID is set, treat it as the *base*.
+      - Append a date+hour-minute suffix for natural rerun sequencing: _YYYYMMDD_HHMM
+      - Set REFLEX_RUN_ID_NO_SUFFIX=1 to keep the base id unchanged (old behavior).
+      - Set REFLEX_RUN_ID_SUFFIX_TZ=UTC to suffix in UTC (default is local time).
+    """
+    base = (
         os.getenv("REFLEX_RUN_ID")
         or os.getenv("REFLEX_RUN_ID".replace("__", "_"))  # just in case
         or "ross_bull_flag_dev"
     )
 
+    if os.getenv("REFLEX_RUN_ID_NO_SUFFIX", "0") == "1":
+        return base
+
+    tz = os.getenv("REFLEX_RUN_ID_SUFFIX_TZ", "").strip().upper()
+    if tz == "UTC":
+        now = datetime.now(timezone.utc)
+    else:
+        # local time (matches your “today / this run” mental model)
+        now = datetime.now()
+
+    suffix = now.strftime("%Y%m%d_%H%M")
+
+    # Avoid double-suffix if the user already put a suffix on the base.
+    # (Very lightweight check: endswith _NNNNNNNN_NNNN)
+    if len(base) >= 14 and base[-13] == "_" and base[-8] == "_":
+        tail = base[-13:]
+        if tail.replace("_", "").isdigit():
+            return base
+
+    return f"{base}_{suffix}"
+
+
 
 RUN_ID = get_run_id()
+
+# Debug logging gate (set REFLEX_DEBUG=1 for verbose per-bar output)
+DEBUG = bool(int(os.getenv("REFLEX_DEBUG", "0")))
+
 
 
 def require_env(name: str) -> str:
@@ -79,6 +117,7 @@ def resolve_pg_dsn() -> str:
         val = os.getenv(key)
         if val:
             return val
+
     # As a very last resort, allow bare libpq-style envs, but only if all are present
     host = os.getenv("PGHOST")
     user = os.getenv("PGUSER")
@@ -87,6 +126,7 @@ def resolve_pg_dsn() -> str:
     port = os.getenv("PGPORT", "5432")
     if host and user and password and db:
         return f"postgresql://{user}:{password}@{host}:{port}/{db}"
+
     raise RuntimeError("No Postgres DSN found. Set REFLEX_PG_DSN or PG_DSN.")
 
 
@@ -102,6 +142,7 @@ def resolve_parquet_root() -> Path:
         val = os.getenv(key)
         if val:
             return Path(val)
+
     raise RuntimeError(
         "No parquet root configured. Set REFLEX_STORAGE_PARQUET_ROOT or PARQUET_ROOT."
     )
@@ -122,7 +163,7 @@ def date_range_inclusive(start: date, end: date) -> Iterable[date]:
 # PARQUET LOADING
 # ------------------------------------------------------------
 
-def _detect_columns(df: pd.DataFrame):
+def _detect_columns(df: pd.DataFrame) -> Tuple[str, str, str]:
     ts_col = None
     for c in ("timestamp", "ts", "time"):
         if c in df.columns:
@@ -151,6 +192,7 @@ def _detect_columns(df: pd.DataFrame):
 
 
 def load_ticks(parquet_root: Path, symbol: str, d: date) -> pd.DataFrame | None:
+    print(f"[INFO] loading ticks for {symbol} {d}")
     """
     Expects layout:
         {parquet_root}/{SYMBOL}/{SYMBOL}_{YYYY-MM-DD}.parquet
@@ -164,7 +206,9 @@ def load_ticks(parquet_root: Path, symbol: str, d: date) -> pd.DataFrame | None:
 
     ts_col, px_col, size_col = _detect_columns(df)
     df = df[[ts_col, px_col, size_col]].copy()
-    df.rename(columns={ts_col: "timestamp", px_col: "price", size_col: "size"}, inplace=True)
+    df.rename(
+        columns={ts_col: "timestamp", px_col: "price", size_col: "size"}, inplace=True
+    )
 
     # ensure timezone-aware UTC
     if not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
@@ -192,6 +236,7 @@ def list_all_symbols(parquet_root: Path) -> List[str]:
 
 
 def resolve_symbol_pattern(parquet_root: Path, pattern: str) -> List[str]:
+    print(f"[INFO] resolving symbol pattern: {pattern}")
     pattern = pattern.strip()
     if not pattern:
         return []
@@ -222,11 +267,16 @@ def resolve_symbol_pattern(parquet_root: Path, pattern: str) -> List[str]:
 @dataclass
 class PatternEvent:
     symbol: str
-    index: int          # index into original tick df
+    index: int  # index into original tick df
     event_ts: datetime  # breakout tick ts
     bucket_ts: datetime
     price_event: float
-    strength: float     # approximate pole % move
+    strength: float  # approximate pole % move
+
+    # Tagging for research: primary vs add, and parent linkage for adds.
+    entry_kind: str = "primary"              # "primary" | "add"
+    parent_event_ts: datetime | None = None  # for adds: the primary event_ts
+
     pattern_name: str = "ross_bull_flag"
 
 
@@ -243,6 +293,9 @@ def find_ross_bull_flag_events(df: pd.DataFrame, symbol: str) -> List[PatternEve
     3) Breakout:
        - current price > prior 45s high * (1 + breakout_eps)
        - current notional volume >= a day-level percentile threshold
+
+    NOTE: This detector is intentionally approximate; the real value is in
+    forward-shape + trade-like metrics for research.
     """
     events: List[PatternEvent] = []
 
@@ -254,32 +307,96 @@ def find_ross_bull_flag_events(df: pd.DataFrame, symbol: str) -> List[PatternEve
     s = ticks.set_index("timestamp")
 
     # 1-second bars: last price, sum size/notional
-    bars = (
-        s.resample("1S")
-        .agg({"price": "last", "size": "sum", "notional": "sum"})
-        .dropna(subset=["price"])
-    )
+    # IMPORTANT: densify to a true 1-second timeline.
+    # Our tick data only has rows for seconds that traded. If we drop empty
+    # seconds, time-based rolling windows (e.g. "120s") become liquidity-dependent
+    # and can produce NaNs for most of the day on thin names.
+    bars = s.resample("1s").agg({"price": "last", "size": "sum", "notional": "sum"})
+
+    # Forward-fill last trade price across empty seconds; treat size/notional as 0.
+    bars["price"] = bars["price"].ffill()
+    bars[["size", "notional"]] = bars[["size", "notional"]].fillna(0.0)
+
+    # Drop any leading pre-first-trade seconds that still have no price.
+    bars = bars.dropna(subset=["price"])
     if bars.empty:
         return events
 
     # core parameters (tunable)
-    pole_window = "120s"       # lookback for the pole (2 minutes)
-    flag_window = 45           # seconds of consolidation we're looking back
-    min_pole_ret = 0.06        # >= 6% move in 2 minutes
-    max_flag_pullback = 0.40   # <= 40% retrace from local high
-    breakout_eps = 0.001       # breakout slightly above prior high
-    vol_percentile = 70        # breakout bar notional >= this day percentile
+    pole_window = "120s"  # lookback for the pole (2 minutes)
+    flag_window = 45  # seconds of consolidation we're looking back
+    min_pole_ret = 0.04  # >= 6% move in 2 minutes
+    max_flag_pullback = 0.40  # <= 40% retrace from local high
+    breakout_eps = 0.001  # breakout slightly above prior high
+    vol_percentile = 70  # breakout bar notional >= this day percentile
+    min_pole_trades = 10  # minimum traded-seconds in the 2-minute window to trust swing_low
 
-    # 2-minute swing low for pole
-    bars["swing_low_2m"] = bars["price"].rolling(pole_window, min_periods=10).min()
+    # Identify seconds that actually traded (used for gating + iteration).
+    # Note: after we densify and fill, size/notional are 0 for empty seconds.
+    bars["traded"] = bars["notional"] > 0
+
+    # 2-minute swing low for pole (computed on dense 1s price, so it's always defined once price exists).
+    # We *gate* pole detection using trade_count_2m so thin names don't fabricate signals off pure forward-fill.
+    bars["trade_count_2m"] = bars["traded"].rolling(pole_window, min_periods=1).sum()
+    bars["swing_low_2m"] = bars["price"].rolling(pole_window, min_periods=1).min()
     bars["ret_from_2m_low"] = bars["price"] / bars["swing_low_2m"] - 1.0
 
-    # day-level notional threshold for "decent" volume
-    vol_threshold = np.nanpercentile(bars["notional"].to_numpy(), vol_percentile)
 
-    for ts, row in bars.iterrows():
+
+    # day-level notional threshold for "decent" volume
+    # Use non-zero notional when possible; otherwise a day full of zero-volume
+    # seconds would make the percentile trivially 0 and defeat the filter.
+    notional_arr = bars["notional"].to_numpy(dtype=float)
+    nz = notional_arr[notional_arr > 0]
+    if nz.size >= 10:
+        vol_threshold = float(np.nanpercentile(nz, vol_percentile))
+    else:
+        vol_threshold = float(np.nanpercentile(notional_arr, vol_percentile)) if notional_arr.size else 0.0
+
+
+    print(
+        f"[INFO] evaluating {len(bars)} bars for symbol {symbol}: "
+        f"vol_threshold={vol_threshold}, pole_window={pole_window}, flag_window={flag_window}, "
+        f"min_pole_ret={min_pole_ret}, max_flag_pullback={max_flag_pullback}, "
+        f"breakout_eps={breakout_eps}, vol_percentile={vol_percentile}"
+    )
+
+    # Evaluate only traded seconds for pattern logic (dense bars exist only to make rolling windows stable).
+    bars_eval = bars[bars["traded"]]
+
+    # --- de-dupe + add state ---
+    primary_min_gap_sec = int(os.getenv("RBF_PRIMARY_MIN_GAP_SEC", "60"))
+    add_enabled = os.getenv("RBF_ENABLE_ADDS", "1") != "0"
+    add_cooldown_sec = int(os.getenv("RBF_ADD_COOLDOWN_SEC", "20"))
+    add_flag_window_sec = int(os.getenv("RBF_ADD_FLAG_WINDOW_SEC", "25"))
+    add_max_pullback = float(os.getenv("RBF_ADD_MAX_PULLBACK", "0.15"))
+    add_min_pullback = float(os.getenv("RBF_ADD_MIN_PULLBACK", "0.005"))
+    add_breakout_eps = float(os.getenv("RBF_ADD_BREAKOUT_EPS", str(breakout_eps)))
+    add_min_gap_sec = int(os.getenv("RBF_ADD_MIN_GAP_SEC", "30"))
+    add_search_max_sec = int(os.getenv("RBF_ADD_SEARCH_MAX_SEC", "600"))  # stop looking for adds after N seconds
+
+    last_primary_event_ts: datetime | None = None   # tick-time of primary event
+    last_primary_trigger_ts: datetime | None = None # bar-time (second) trigger ts
+    last_primary_price_event: float | None = None
+    next_add_earliest_ts: datetime | None = None
+    last_add_event_ts: datetime | None = None
+
+    for ts, row in bars_eval.iterrows():
+        if DEBUG:
+            print(
+                f"[DBG] {symbol} {ts} px={row['price']} "
+                f"low2m={row['swing_low_2m']} ret2m={row['ret_from_2m_low']} "
+                f"notional={row['notional']} trades2m={row.get('trade_count_2m', 0)}"
+            )
+
+        # -------------------------
+        # PRIMARY RBF DETECTION
+        # -------------------------
         swing_low = row["swing_low_2m"]
         if not np.isfinite(swing_low) or swing_low <= 0:
+            continue
+
+        if float(row.get("trade_count_2m", 0)) < min_pole_trades:
             continue
 
         price_now = float(row["price"])
@@ -302,18 +419,23 @@ def find_ross_bull_flag_events(df: pd.DataFrame, symbol: str) -> List[PatternEve
         retr_from_high = (flag_high - flag_low) / flag_high
 
         # require "flag-like" behavior: some pullback, but not a full reset
-        if retr_from_high < 0.01:      # basically straight up; no flag
+        if retr_from_high < 0.01:
             continue
         if retr_from_high > max_flag_pullback:
-            continue  # too deep; more like a full shakeout
+            continue
 
         # breakout: price clears the flag high with a small cushion
         if price_now <= flag_high * (1.0 + breakout_eps):
             continue
 
         # volume confirmation on the breakout bar
-        if row["notional"] < vol_threshold:
+        if float(row["notional"]) < vol_threshold:
             continue
+
+        # primary de-dupe (bar-time trigger spacing)
+        if last_primary_trigger_ts is not None:
+            if (ts - last_primary_trigger_ts).total_seconds() < primary_min_gap_sec:
+                continue
 
         # Map breakout time back to tick index: first tick at or after this bar
         mask_ticks = ticks["timestamp"] >= ts
@@ -326,7 +448,6 @@ def find_ross_bull_flag_events(df: pd.DataFrame, symbol: str) -> List[PatternEve
         event_ts = tick_row["timestamp"].to_pydatetime()
         bucket_ts = event_ts.replace(second=0, microsecond=0)
         price_event = float(tick_row["price"])
-        strength = float(swing_ret)
 
         events.append(
             PatternEvent(
@@ -335,16 +456,120 @@ def find_ross_bull_flag_events(df: pd.DataFrame, symbol: str) -> List[PatternEve
                 event_ts=event_ts,
                 bucket_ts=bucket_ts,
                 price_event=price_event,
-                strength=strength,
+                strength=float(swing_ret),
+                entry_kind="primary",
+                parent_event_ts=None,
                 pattern_name="ross_bull_flag",
             )
         )
 
+        # prime add state off the primary
+        last_primary_event_ts = event_ts
+        last_primary_trigger_ts = ts
+        last_primary_price_event = price_event
+        next_add_earliest_ts = ts + timedelta(seconds=add_cooldown_sec)
+        last_add_event_ts = None
+
+        # continue scanning (you may still find later primaries after min_gap)
+
+        # -------------------------
+        # ADD DETECTION (micro-flag)
+        # -------------------------
+        # Adds are searched in subsequent iterations (not in the same bar).
+        # We intentionally keep adds "close" to the primary: short window + tight pullback + above primary price.
+
+    # Second pass for adds: scan forward after each primary trigger.
+    # This keeps primary detection clean and makes add logic easier to reason about.
+    if add_enabled and events:
+        primaries = [e for e in events if e.entry_kind == "primary"]
+        for p in primaries:
+            # bar-time trigger approximation: align to the first traded-second >= primary tick time
+            p_trigger_candidates = bars_eval.index[bars_eval.index >= p.event_ts]
+            if len(p_trigger_candidates) == 0:
+                continue
+            p_trigger = p_trigger_candidates[0]
+
+            add_start = p_trigger + timedelta(seconds=add_cooldown_sec)
+            add_end = p_trigger + timedelta(seconds=add_search_max_sec)
+
+            last_add_ts_local: datetime | None = None
+
+            add_scan = bars_eval[(bars_eval.index >= add_start) & (bars_eval.index <= add_end)]
+            for ts, row in add_scan.iterrows():
+                if last_add_ts_local is not None and (ts - last_add_ts_local).total_seconds() < add_min_gap_sec:
+                    continue
+
+                price_now = float(row["price"])
+
+                # must be meaningfully above the primary entry price to qualify as an add attempt
+                if price_now <= float(p.price_event) * 1.001:
+                    continue
+
+                # micro flag: shorter consolidation window
+                window_start = ts - timedelta(seconds=add_flag_window_sec)
+                window_end = ts - timedelta(seconds=3)
+                w = bars[(bars.index >= window_start) & (bars.index <= window_end)]
+                if len(w) < 10:
+                    continue
+
+                hi = float(w["price"].max())
+                lo = float(w["price"].min())
+                if hi <= 0:
+                    continue
+
+                pullback = (hi - lo) / hi
+                if pullback < add_min_pullback:
+                    continue
+                if pullback > add_max_pullback:
+                    continue
+
+                # breakout above micro-high
+                if price_now <= hi * (1.0 + add_breakout_eps):
+                    continue
+
+                # softer volume confirmation for adds
+                if float(row["notional"]) < (vol_threshold * 0.50):
+                    continue
+
+                mask_ticks = ticks["timestamp"] >= ts
+                if not mask_ticks.any():
+                    continue
+                event_idx = int(mask_ticks.idxmax())
+                tick_row = ticks.loc[event_idx]
+
+                event_ts = tick_row["timestamp"].to_pydatetime()
+
+                # global add de-dupe
+                if last_add_event_ts is not None and (event_ts - last_add_event_ts).total_seconds() < add_min_gap_sec:
+                    continue
+
+                bucket_ts = event_ts.replace(second=0, microsecond=0)
+                price_event = float(tick_row["price"])
+                strength = (price_event / lo - 1.0) if lo > 0 else 0.0
+
+                events.append(
+                    PatternEvent(
+                        symbol=symbol,
+                        index=event_idx,
+                        event_ts=event_ts,
+                        bucket_ts=bucket_ts,
+                        price_event=price_event,
+                        strength=float(strength),
+                        entry_kind="add",
+                        parent_event_ts=p.event_ts,
+                        pattern_name="ross_bull_flag_add",
+                    )
+                )
+
+                last_add_ts_local = ts
+                last_add_event_ts = event_ts
+
+    return events
     return events
 
 
 # ------------------------------------------------------------
-# FORWARD SHAPE WITH ADVANCED RISK METRICS
+# FORWARD SHAPE WITH CORE SHAPE METRICS
 # ------------------------------------------------------------
 
 @dataclass
@@ -360,8 +585,8 @@ class ForwardShape:
     vol_sum: float
     vol_peak: float
     vol_peak_offset: int
-    ret_path: List[float]
-    vol_path: List[float]
+    ret_path: list[float]
+    vol_path: list[float]
     hit_target: bool
     hit_stop: bool
     shape_label: str
@@ -372,6 +597,30 @@ class ForwardShape:
     frac_above_entry: float
     frac_below_entry: float
 
+    # --- Trade lifecycle / shape metrics (JSON only) ---
+    # All times are seconds from entry tick.
+    safety_ret: float
+    tts_sec: int | None                 # Time to Safety
+    early_mae_to_safety: float | None   # Worst ret before safety (or before exit if never safe)
+    time_underwater_to_safety: int | None
+    tfp_sec: int | None                 # Time to First Profit (first ret > 0)
+
+    clut_sec: int                       # Capital Lock-Up Time (exit - entry)
+    exit_reason: str                    # 'target' | 'stop' | 'timeout'
+    realized_r: float                   # realized return at exit
+    rpm: float | None                   # realized_r / (clut_sec/60)
+
+    efficiency: float | None            # realized_r / MFE
+    mae_over_mfe: float | None          # abs(MAE) / MFE
+
+    direction_changes: int | None
+    slope_per_min: float | None
+    slope_r2: float | None
+
+    vol_expand_sec: int | None
+    vol_expand_before_safety: bool | None
+    vol_peak_sec: int | None
+
 
 def compute_forward_shapes(
     df: pd.DataFrame,
@@ -379,12 +628,23 @@ def compute_forward_shapes(
     horizons: Sequence[int],
     target_ret: float = 0.05,
     stop_ret: float = -0.03,
+    safe_ret: float | None = None,
 ) -> List[ForwardShape]:
+    """
+    Compute forward-shape windows plus trade-like stats.
+
+    - Entry is the event tick (event_idx)
+    - For trade-like metrics we treat the horizon window as a hard timeout.
+
+    safe_ret defaults to target_ret (common first pass: safety == +0.05R).
+    """
     if df.empty:
         return []
 
     ts0 = df.loc[event_idx, "timestamp"]
     p0 = float(df.loc[event_idx, "price"])
+
+    safe_ret_val = float(target_ret if safe_ret is None else safe_ret)
 
     window_max_h = max(horizons)
     horizon_end = ts0 + timedelta(minutes=window_max_h)
@@ -427,13 +687,34 @@ def compute_forward_shapes(
                     ru_over_dd=0.0,
                     frac_above_entry=0.0,
                     frac_below_entry=0.0,
+                    safety_ret=safe_ret_val,
+                    tts_sec=None,
+                    early_mae_to_safety=None,
+                    time_underwater_to_safety=None,
+                    tfp_sec=None,
+                    clut_sec=0,
+                    exit_reason="no_data",
+                    realized_r=0.0,
+                    rpm=None,
+                    efficiency=None,
+                    mae_over_mfe=None,
+                    direction_changes=None,
+                    slope_per_min=None,
+                    slope_r2=None,
+                    vol_expand_sec=None,
+                    vol_expand_before_safety=None,
+                    vol_peak_sec=None,
                 )
             )
             continue
 
-        rets = w["ret"].to_numpy()
-        vols = w["notional"].to_numpy()
+        # Arrays
+        ts = w["timestamp"]
+        rets = w["ret"].to_numpy(dtype=float)
+        vols = w["notional"].to_numpy(dtype=float)
+        tsec = (ts - ts0).dt.total_seconds().to_numpy(dtype=float)
 
+        # Core forward-shape metrics
         p_h = float(w.iloc[-1]["price"])
         fwd_ret = float(rets[-1])
 
@@ -452,10 +733,10 @@ def compute_forward_shapes(
         else:
             vol_peak_idx = 0
             vol_peak = 0.0
-
         vol_peak_offset = vol_peak_idx
+        vol_peak_sec = int(round(float(tsec[vol_peak_idx]))) if len(tsec) else None
 
-        # coarse 5-bucket paths
+        # coarse 5-bucket paths (for clustering later; do not bucket the *trade* itself)
         ret_chunks = np.array_split(rets, 5)
         vol_chunks = np.array_split(vols, 5)
         ret_path = [float(c.mean()) if len(c) else float("nan") for c in ret_chunks]
@@ -473,18 +754,17 @@ def compute_forward_shapes(
         else:
             label = "meh"
 
-        # advanced metrics
+        # --- Advanced forward metrics (existing) ---
         if len(rets):
-            # worst drawdown before the max runup index
             ru_idx = time_to_max_runup
             if ru_idx > 0:
                 dd_before = float(np.minimum.accumulate(rets[: ru_idx + 1]).min())
             else:
                 dd_before = 0.0
 
-            above = np.count_nonzero(rets > 0.0)
-            below = np.count_nonzero(rets < 0.0)
-            total = len(rets)
+            above = int(np.count_nonzero(rets > 0.0))
+            below = int(np.count_nonzero(rets < 0.0))
+            total = int(len(rets))
             frac_above = above / total if total > 0 else 0.0
             frac_below = below / total if total > 0 else 0.0
         else:
@@ -496,6 +776,113 @@ def compute_forward_shapes(
             ru_over_dd = max_runup / abs(max_drawdown) if abs(max_drawdown) > 1e-6 else 0.0
         else:
             ru_over_dd = 0.0
+
+        # ------------------------------------------------------------
+        # Trade-like shape metrics (your "non-negotiables")
+        # ------------------------------------------------------------
+
+        # Time to first profit (first ret > 0)
+        tfp_sec = None
+        idx_tfp = np.where(rets > 0.0)[0]
+        if len(idx_tfp):
+            tfp_sec = int(round(float(tsec[int(idx_tfp[0])])))
+
+        # Time to safety (first ret >= safety)
+        tts_sec = None
+        idx_safe = np.where(rets >= safe_ret_val)[0]
+        safe_i = None
+        if len(idx_safe):
+            safe_i = int(idx_safe[0])
+            tts_sec = int(round(float(tsec[safe_i])))
+
+        # Exit: first hit of target/stop else timeout at horizon
+        exit_i = len(rets) - 1
+        exit_reason = "timeout"
+        hit_t = np.where(rets >= target_ret)[0]
+        hit_s = np.where(rets <= stop_ret)[0]
+        cand = []
+        if len(hit_t):
+            cand.append((int(hit_t[0]), "target"))
+        if len(hit_s):
+            cand.append((int(hit_s[0]), "stop"))
+        if cand:
+            exit_i, exit_reason = min(cand, key=lambda x: x[0])
+
+        realized_r = float(rets[exit_i]) if len(rets) else 0.0
+        clut_sec = int(round(float(tsec[exit_i]))) if len(tsec) else 0
+        rpm = (realized_r / (clut_sec / 60.0)) if clut_sec > 0 else None
+
+        # Early MAE (before safety)
+        if safe_i is not None:
+            early_slice = rets[: safe_i + 1]
+        else:
+            early_slice = rets[: exit_i + 1]
+        early_mae_to_safety = float(np.min(early_slice)) if len(early_slice) else None
+
+        # Time underwater (before safety)
+        time_underwater = None
+        if len(tsec) >= 2:
+            end_i = safe_i if safe_i is not None else exit_i
+            end_i = min(end_i, len(rets) - 1)
+            uw = 0.0
+            # integrate time where ret < 0 using left-hand value per segment
+            for i in range(0, end_i):
+                dt = float(tsec[i + 1] - tsec[i])
+                if dt < 0:
+                    continue
+                if rets[i] < 0.0:
+                    uw += dt
+            time_underwater = int(round(uw))
+
+        # Profit quality
+        mfe = max_runup if max_runup > 0 else None
+        mae = max_drawdown if max_drawdown < 0 else None
+        efficiency = (realized_r / mfe) if (mfe is not None and abs(mfe) > 1e-9) else None
+        mae_over_mfe = (abs(mae) / mfe) if (mfe is not None and mae is not None and abs(mfe) > 1e-9) else None
+
+        # Direction changes (chop proxy)
+        direction_changes = None
+        if len(rets) >= 3:
+            d = np.diff(rets)
+            eps = 0.0002  # 2 bps: ignore microscopic jiggle
+            signs = np.sign(d)
+            signs[np.abs(d) < eps] = 0
+            # compress zeros
+            non0 = [int(s) for s in signs if s != 0]
+            if len(non0) >= 2:
+                direction_changes = sum(1 for a, b in zip(non0, non0[1:]) if a != b)
+            else:
+                direction_changes = 0
+
+        # Slope consistency (trendiness) using simple linear regression on ret vs seconds
+        slope_per_min = None
+        slope_r2 = None
+        if len(rets) >= 5 and len(tsec) == len(rets):
+            x = tsec[: exit_i + 1]
+            y = rets[: exit_i + 1]
+            x0 = x - float(x.mean())
+            denom = float((x0 ** 2).sum())
+            if denom > 1e-9:
+                b = float((x0 * (y - float(y.mean()))).sum() / denom)  # ret per second
+                slope_per_min = b * 60.0
+                y_hat = float(y.mean()) + b * (x - float(x.mean()))
+                ss_res = float(((y - y_hat) ** 2).sum())
+                ss_tot = float(((y - float(y.mean())) ** 2).sum())
+                slope_r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 1e-12 else None
+
+        # Volatility expansion timing (simple: first time notional > 2x rolling median baseline)
+        vol_expand_sec = None
+        vol_expand_before_safety = None
+        if len(vols) >= 10 and len(tsec) == len(vols):
+            # baseline: median of first 30 seconds (or first 20% of window)
+            baseline_mask = tsec <= min(30.0, float(tsec[-1]) * 0.2)
+            base = float(np.median(vols[baseline_mask])) if baseline_mask.any() else float(np.median(vols))
+            thr = base * 2.0
+            idx = np.where(vols >= thr)[0]
+            if len(idx):
+                vol_expand_sec = int(round(float(tsec[int(idx[0])])))
+                if tts_sec is not None:
+                    vol_expand_before_safety = bool(vol_expand_sec <= tts_sec)
 
         out.append(
             ForwardShape(
@@ -519,6 +906,23 @@ def compute_forward_shapes(
                 ru_over_dd=ru_over_dd,
                 frac_above_entry=frac_above,
                 frac_below_entry=frac_below,
+                safety_ret=safe_ret_val,
+                tts_sec=tts_sec,
+                early_mae_to_safety=early_mae_to_safety,
+                time_underwater_to_safety=time_underwater,
+                tfp_sec=tfp_sec,
+                clut_sec=clut_sec,
+                exit_reason=exit_reason,
+                realized_r=realized_r,
+                rpm=rpm,
+                efficiency=efficiency,
+                mae_over_mfe=mae_over_mfe,
+                direction_changes=direction_changes,
+                slope_per_min=slope_per_min,
+                slope_r2=slope_r2,
+                vol_expand_sec=vol_expand_sec,
+                vol_expand_before_safety=vol_expand_before_safety,
+                vol_peak_sec=vol_peak_sec,
             )
         )
 
@@ -530,10 +934,7 @@ def compute_forward_shapes(
 # ------------------------------------------------------------
 
 def _clean_for_json(obj):
-    """
-    Recursively walk lists/dicts and replace NaN/inf floats
-    with None so JSON/JSONB will accept them.
-    """
+    """Recursively replace NaN/inf floats with None so JSON/JSONB will accept them."""
     if isinstance(obj, float):
         if math.isnan(obj) or math.isinf(obj):
             return None
@@ -580,8 +981,9 @@ def upsert_forward_shape(
     shape: ForwardShape,
 ) -> None:
     """
-    pattern_forward_shape gets the "core" metrics only.
-    Advanced metrics live in the JSON payload of pattern_feature_record.
+    pattern_forward_shape gets the "core" forward metrics only.
+
+    Core shape/trade metrics live in the JSON payload of pattern_feature_record.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -654,6 +1056,8 @@ def insert_feature_record(
     pattern_name: str,
     price_event: float,
     shapes: List[ForwardShape],
+    entry_kind: str,
+    parent_event_ts: datetime | None,
 ) -> None:
     payload = [
         {
@@ -673,12 +1077,34 @@ def insert_feature_record(
             "hit_target": s.hit_target,
             "hit_stop": s.hit_stop,
             "shape_label": s.shape_label,
-            # advanced metrics
+
+            # tagging
+            "entry_kind": entry_kind,
+            "parent_event_ts": parent_event_ts.isoformat() if parent_event_ts else None,
+
+            # existing advanced metrics
             "dd_before_runup": s.dd_before_runup,
             "ru_over_dd": s.ru_over_dd,
             "frac_above_entry": s.frac_above_entry,
             "frac_below_entry": s.frac_below_entry,
-        }
+            # trade lifecycle / core shape metrics
+            "safety_ret": s.safety_ret,
+            "tts_sec": s.tts_sec,
+            "early_mae_to_safety": s.early_mae_to_safety,
+            "time_underwater_to_safety": s.time_underwater_to_safety,
+            "tfp_sec": s.tfp_sec,
+            "clut_sec": s.clut_sec,
+            "exit_reason": s.exit_reason,
+            "realized_r": s.realized_r,
+            "rpm": s.rpm,
+            "efficiency": s.efficiency,
+            "mae_over_mfe": s.mae_over_mfe,
+            "direction_changes": s.direction_changes,
+            "slope_per_min": s.slope_per_min,
+            "slope_r2": s.slope_r2,
+            "vol_expand_sec": s.vol_expand_sec,
+            "vol_expand_before_safety": s.vol_expand_before_safety,
+            "vol_peak_sec": s.vol_peak_sec,        }
         for s in shapes
     ]
     payload = _clean_for_json(payload)
@@ -717,6 +1143,8 @@ def run_one_day_for_symbol(
     if not events:
         return
 
+    # NOTE: we don't dedupe overlapping events yet. If this becomes noisy,
+    # we can add a simple cooldown window (e.g., 60-120s) later.
     for ev in events:
         shapes = compute_forward_shapes(df, ev.index, horizons=horizons)
         if not shapes:
@@ -725,7 +1153,7 @@ def run_one_day_for_symbol(
         upsert_pattern_hit(conn, ev)
         for s in shapes:
             upsert_forward_shape(conn, ev.symbol, ev.event_ts, ev.pattern_name, s)
-        insert_feature_record(conn, ev.symbol, ev.event_ts, ev.pattern_name, ev.price_event, shapes)
+        insert_feature_record(conn, ev.symbol, ev.event_ts, ev.pattern_name, ev.price_event, shapes, ev.entry_kind, ev.parent_event_ts)
 
         print(
             f"[OK] {symbol} {d} {ev.event_ts} {ev.pattern_name} → {len(shapes)} forward windows stored"
@@ -744,7 +1172,8 @@ def run_for_symbols_and_range(
     dsn = resolve_pg_dsn()
 
     print(f"[INFO] PARQUET_ROOT={parquet_root}")
-    print(f"[INFO] PG_DSN={dsn.split('@')[-1]}")  # print only host/db part
+    # print only host/db part (avoid leaking credentials)
+    print(f"[INFO] PG_DSN={dsn.split('@')[-1]}")
 
     with psycopg.connect(dsn) as conn:
         for sym in symbols:
@@ -796,7 +1225,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     start = parse_date(start_str)
     end = parse_date(end_str) if end_str else start
 
-    # Horizons tuned for Ross-style intraday scalps (ticks, measured in minutes)
+    # Horizons tuned for Ross-style intraday scalps (trade-like view uses horizon as timeout)
     horizons = (1, 3, 5, 10)
 
     parquet_root = resolve_parquet_root()

@@ -1,4 +1,8 @@
-import json, sys, time, os
+import json
+import sys
+import time
+import os
+import traceback
 
 LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40}
 
@@ -9,6 +13,21 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 def _enabled(level: str) -> bool:
     return LEVELS.get(level, 20) >= LEVELS.get(LOG_LEVEL, 20)
+
+def _truthy(v: str | None) -> bool:
+    return (v or "").strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _json_default(o):
+    # Make logger resilient: Redis/pubsub often includes bytes.
+    if isinstance(o, (bytes, bytearray, memoryview)):
+        b = bytes(o)
+        # Don't explode logs with megabytes of hex; summarize.
+        if len(b) > 96:
+            return f"<bytes len={len(b)} hex={b[:32].hex()}...>"
+        return b.hex()
+    # Fallback: stringify unknown objects
+    return str(o)
 
 
 def log(level: str, component: str, msg: str, **extra):
@@ -24,7 +43,7 @@ def log(level: str, component: str, msg: str, **extra):
     }
     if extra:
         rec["extra"] = extra
-    sys.stdout.write(json.dumps(rec) + "\n")
+    sys.stdout.write(json.dumps(rec, default=_json_default) + "\n")
     sys.stdout.flush()
 
 
@@ -32,6 +51,13 @@ def debug(c, m, **k): log("DEBUG", c, m, **k)
 def info(c, m, **k):  log("INFO",  c, m, **k)
 def warn(c, m, **k):  log("WARN",  c, m, **k)
 def error(c, m, **k): log("ERROR", c, m, **k)
+
+
+def exception(c, m, **k):
+    # Log current exception stack (must be called inside except:)
+    k = dict(k) if k else {}
+    k["traceback"] = traceback.format_exc()
+    log("ERROR", c, m, **k)
 
 
 # ----------------------------------------------------------------------
@@ -70,5 +96,10 @@ def get_logger(component: str):
             if args:
                 msg = msg % args
             error(self._c, msg, **kwargs)
+
+        def exception(self, msg: str, *args, **kwargs):
+            if args:
+                msg = msg % args
+            exception(self._c, msg, **kwargs)
 
     return _Logger(component)

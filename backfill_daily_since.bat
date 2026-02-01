@@ -27,7 +27,7 @@ if not exist "%PY%" set "PY=python"
 set "MODULE=tools.symbol_manager.db_backfill"
 
 echo [RUN] DAILY backfill ALL since %SINCE%
-"%PY%" -m %MODULE% --kind daily --symbol ALL --since %SINCE%
+"%PY%" -m %MODULE% --kind daily --symbol BNAI --since %SINCE%
 set "RC=%errorlevel%"
 
 if not "%RC%"=="0" (

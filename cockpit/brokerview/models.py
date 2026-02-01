@@ -68,6 +68,11 @@ class PositionDoc(BaseModel):
     unrealized_plpc: Optional[float] = None
     realized_pl: Optional[float] = None
 
+    stop_price: Optional[float] = None
+    target_price: Optional[float] = None
+    take_profit_price: Optional[float] = None
+
+
     # some feeds may send this as null / missing when flat
     side: Optional[PositionSide] = None
 
@@ -98,6 +103,8 @@ class OrderDoc(BaseModel):
 
     qty: Optional[float] = None
     filled_qty: Optional[float] = None
+    filled_avg_price: Optional[float] = None
+
 
     limit_price: Optional[float] = None
     stop_price: Optional[float] = None

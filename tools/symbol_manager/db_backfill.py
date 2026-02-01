@@ -31,6 +31,8 @@ from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 import psycopg
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 # --------------------------------------------------------------------------------------
@@ -57,6 +59,7 @@ class BackfillStats:
     rows_upserted: int = 0
 
     elapsed_sec: float = 0.0
+
 
 # --------------------------------------------------------------------------------------
 # Logging
@@ -89,6 +92,8 @@ def _setup_file_logging(repo_root: Path, kind: str, run_id: str) -> None:
             LOG.warning("backfill.logfile.setup_failed err=%r", e)
         except Exception:
             pass
+
+
 # --------------------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------------------
@@ -202,8 +207,6 @@ def extract_trade_ts_utc(tr: dict[str, Any]) -> Optional[dt.datetime]:
     return None
 
 
-
-
 def apply_start_symbol(symbols: list[str], start_symbol: str | None, start_after: str | None) -> list[str]:
     """Return a filtered, deterministic symbol list based on resume pointers.
 
@@ -237,6 +240,55 @@ def apply_start_symbol(symbols: list[str], start_symbol: str | None, start_after
             if s >= needle:
                 return syms[i:]
         return []
+
+
+# --------------------------------------------------------------------------------------
+# Tick-archived policy (KISS)
+# --------------------------------------------------------------------------------------
+
+TICK_ARCHIVE_CUTOFF = dt.date(2026, 1, 1)
+
+# Tick-archived policy (KISS)
+TICK_ARCHIVE_CUTOFF = dt.date(2026, 1, 1)
+
+def _filters_has_tick_archived(filters: Any) -> bool:
+    """
+    symbol_metadata.filters can be:
+      - text (e.g., 'tick_archived')
+      - text[] (Python list of strings)
+      - NULL
+    We treat any occurrence of 'tick_archived' (case-insensitive) as true.
+    """
+    if filters is None:
+        return False
+
+    # If it's a list/tuple/set, check each element
+    if isinstance(filters, (list, tuple, set)):
+        for x in filters:
+            if x is None:
+                continue
+            if str(x).strip().lower() == "tick_archived":
+                return True
+        return False
+
+    # Otherwise treat as scalar string-ish
+    try:
+        return str(filters).strip().lower() == "tick_archived"
+    except Exception:
+        return False
+
+
+def _clamp_eff_start_for_tick_archive(kind: str, eff_start: dt.date, filters: Any) -> dt.date:
+    """
+    If symbol_metadata.filters indicates tick archival, ignore tick planning/fetching earlier than 2026-01-01.
+    Applies ONLY to kind='tick'.
+    """
+    if kind != "tick":
+        return eff_start
+    if _filters_has_tick_archived(filters) and eff_start < TICK_ARCHIVE_CUTOFF:
+        return TICK_ARCHIVE_CUTOFF
+    return eff_start
+
 
 
 # --------------------------------------------------------------------------------------
@@ -290,6 +342,21 @@ class PolygonClient:
         self.base_url = base_url.rstrip("/")
         self.session = requests.Session()
 
+        # Network hardening: automatic retries with exponential backoff for transient failures.
+        retries = Retry(
+            total=8,
+            connect=8,
+            read=8,
+            status=8,
+            backoff_factor=1.0,  # 1s, 2s, 4s, 8s...
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(["GET"]),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retries, pool_connections=20, pool_maxsize=20)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+
     def _get(self, path_or_url: str, params: Optional[dict[str, Any]]) -> dict[str, Any]:
         """HTTP GET helper.
 
@@ -308,16 +375,14 @@ class PolygonClient:
         if params is not None:
             q = dict(params)
             q["apiKey"] = self.api_key
-            resp = self.session.get(url, params=q, timeout=60)
+            resp = self.session.get(url, params=q, timeout=(10, 120))
         else:
-            resp = self.session.get(url, timeout=60)
+            resp = self.session.get(url, timeout=(10, 120))
 
         resp.raise_for_status()
         return resp.json()
 
     def fetch_daily_bars(self, symbol: str, start: dt.date, end: dt.date) -> list[dict[str, Any]]:
-        # This mirrors your existing usage: grouped aggs / range endpoint.
-        # (Exact endpoint details assumed consistent with your original file.)
         path = f"/v2/aggs/ticker/{symbol}/range/1/day/{start.isoformat()}/{end.isoformat()}"
         js = self._get(path, {"adjusted": "true", "sort": "asc", "limit": 50000})
         return js.get("results", []) or []
@@ -326,8 +391,6 @@ class PolygonClient:
         path = f"/v2/aggs/ticker/{symbol}/range/1/minute/{start.isoformat()}/{end.isoformat()}"
         js = self._get(path, {"adjusted": "true", "sort": "asc", "limit": 50000})
         return js.get("results", []) or []
-
-    
 
     # ---------------------------------------------------------------------
     # Ticks (Polygon v3 trades) — day-scoped, follows next_url safely
@@ -345,21 +408,12 @@ class PolygonClient:
                 return urlunparse(u)
             return url
         except Exception:
-            # Worst case: just append with '?'/'&'
             join = "&" if "?" in url else "?"
             return f"{url}{join}apiKey={self.api_key}"
 
     def iter_trades_for_day(self, symbol: str, on_date: dt.date, limit: int = 5000):
         """
         Yield Polygon v3 trade dicts for a symbol on a given *market date*.
-
-        IMPORTANT:
-        - Polygon v3 trades endpoint does NOT reliably filter by a "date=" parameter.
-        - Correct filtering is via nanosecond epoch bounds (timestamp.gte / timestamp.lt).
-        - We define a "day" as America/New_York midnight-to-midnight, then convert to UTC and to ns.
-
-        This prevents the pathological behavior you observed where every day returned the same
-        first page and all rows were out-of-bounds (oob == total, in_bounds == 0).
         """
         sym = (symbol or "").upper().strip()
         if not sym:
@@ -392,7 +446,6 @@ class PolygonClient:
             for tr in results:
                 yield tr
 
-            # v3 pagination: "next_url" is a full URL without apiKey sometimes; re-append if needed.
             next_url = data.get("next_url")
             if not next_url:
                 break
@@ -400,9 +453,9 @@ class PolygonClient:
                 joiner = "&" if "?" in next_url else "?"
                 next_url = f"{next_url}{joiner}apiKey={self.api_key}"
 
-            # gentle backoff to be nice to rate limits
             time.sleep(backoff)
             backoff = min(1.5, backoff * 1.25)
+
 
 class Pg:
     def __init__(self, dsn: str):
@@ -421,20 +474,20 @@ class Pg:
     def rollback(self) -> None:
         self.conn.rollback()
 
-    def get_symbol_list(self, symbol: str) -> list[tuple[str, dt.date | None]]:
+    def get_symbol_list(self, symbol: str) -> list[tuple[str, dt.date | None, str | None]]:
         """
-        Returns list of (symbol, list_date) from public.symbol_metadata.
+        Returns list of (symbol, list_date, filters) from public.symbol_metadata.
         Existing behavior: if symbol == ALL, get all symbols.
         """
         with self.conn.cursor() as cur:
             if symbol.upper() == "ALL":
-                cur.execute("SELECT symbol, list_date FROM public.symbol_metadata ORDER BY symbol")
+                cur.execute("SELECT symbol, list_date, filters FROM public.symbol_metadata ORDER BY symbol")
             else:
                 cur.execute(
-                    "SELECT symbol, list_date FROM public.symbol_metadata WHERE symbol=%s",
+                    "SELECT symbol, list_date, filters FROM public.symbol_metadata WHERE symbol=%s",
                     (symbol.upper(),),
                 )
-            return [(r[0], r[1]) for r in cur.fetchall()]
+            return [(r[0], r[1], r[2]) for r in cur.fetchall()]
 
     def get_trading_days(self, start: dt.date, end: dt.date) -> list[dt.date]:
         """
@@ -458,7 +511,6 @@ class Pg:
             if rows:
                 return [row[0] for row in rows]
         except Exception:
-            # table missing / not populated / permissions -> fallback
             pass
 
         out: list[dt.date] = []
@@ -477,57 +529,55 @@ class Pg:
         return self.get_trading_days(start, end)
 
     def get_present_days(self, kind: str, symbol: str, start: dt.date, end: dt.date) -> set[dt.date]:
-            """
-            Return set of day buckets present for (kind,symbol) within [start,end] inclusive.
-            Presence definition (simple): at least one row exists for that day.
+        """
+        Return set of day buckets present for (kind,symbol) within [start,end] inclusive.
+        Presence definition (simple): at least one row exists for that day.
 
-            NOTE for ticks:
-              We bucket by UTC day to avoid session-timezone surprises.
-            """
-            symbol = symbol.upper()
-            if kind == "daily":
-                table = "public.daily_bars"
-                ts_col = "timestamp"
-            elif kind == "minute":
-                table = "public.minute_bars"
-                ts_col = "timestamp"
-            elif kind == "tick":
-                table = "public.tick_data"
-                ts_col = "timestamp"
+        NOTE for ticks:
+          We bucket by NY "market date" so it matches market_day_bounds_utc()/has_tick_day().
+        """
+        symbol = symbol.upper()
+        if kind == "daily":
+            table = "public.daily_bars"
+            ts_col = "timestamp"
+        elif kind == "minute":
+            table = "public.minute_bars"
+            ts_col = "timestamp"
+        elif kind == "tick":
+            table = "public.tick_data"
+            ts_col = "timestamp"
+        else:
+            raise ValueError(f"Unknown kind: {kind}")
+
+        with self.conn.cursor() as cur:
+            if kind == "tick":
+                start_ts, _ = market_day_bounds_utc(start)
+                _, end_ts = market_day_bounds_utc(end + dt.timedelta(days=1))
+                cur.execute(
+                    f"""
+                    SELECT DISTINCT ({ts_col} AT TIME ZONE 'America/New_York')::date AS d
+                    FROM {table}
+                    WHERE symbol = %s
+                      AND {ts_col} >= %s
+                      AND {ts_col} <  %s
+                    """,
+                    (symbol, start_ts, end_ts),
+                )
             else:
-                raise ValueError(f"Unknown kind: {kind}")
-
-            with self.conn.cursor() as cur:
-                if kind == "tick":
-                    # Bucket by UTC date; constrain by UTC day range
-                    start_ts = dt.datetime.combine(start, dt.time(0, 0), tzinfo=dt.timezone.utc)
-                    end_ts = dt.datetime.combine(end, dt.time(0, 0), tzinfo=dt.timezone.utc) + dt.timedelta(days=1)
-                    cur.execute(
-                        f"""
-                        SELECT DISTINCT ({ts_col} AT TIME ZONE 'UTC')::date AS d
-                        FROM {table}
-                        WHERE symbol = %s
-                          AND {ts_col} >= %s
-                          AND {ts_col} <  %s
-                        """,
-                        (symbol, start_ts, end_ts),
-                    )
-                else:
-                    # date-bucketed tables are already aligned to their stored day keys
-                    cur.execute(
-                        f"""
-                        SELECT DISTINCT {ts_col}::date AS d
-                        FROM {table}
-                        WHERE symbol = %s
-                          AND {ts_col} >= %s::date
-                          AND {ts_col} < (%s::date + interval '1 day')
-                        """,
-                        (symbol, start, end),
-                    )
-                return {row[0] for row in cur.fetchall()}
+                cur.execute(
+                    f"""
+                    SELECT DISTINCT ({ts_col} AT TIME ZONE 'UTC')::date AS d
+                    FROM {table}
+                    WHERE symbol = %s
+                      AND ({ts_col} AT TIME ZONE 'UTC')::date >= %s
+                      AND ({ts_col} AT TIME ZONE 'UTC')::date <= %s
+                    """,
+                    (symbol, start, end),
+                )
+            return {row[0] for row in cur.fetchall()}
 
     def has_tick_day(self, symbol: str, day: dt.date) -> bool:
-        """Fast precheck: does tick_data contain at least one row for (symbol, UTC day)?"""
+        """Fast precheck: does tick_data contain at least one row for (symbol, NY market day)?"""
         symbol = (symbol or "").upper()
         start_ts, end_ts = market_day_bounds_utc(day)
         with self.conn.cursor() as cur:
@@ -544,13 +594,11 @@ class Pg:
             )
             return cur.fetchone() is not None
 
-
     def upsert_daily_rows(self, symbol: str, rows: list[dict[str, Any]]) -> int:
         if not rows:
             return 0
         with self.conn.cursor() as cur:
             for r in rows:
-                # Polygon aggs format: t(ms), o,h,l,c,v
                 ts = dt.datetime.fromtimestamp(r["t"] / 1000, tz=dt.timezone.utc)
                 cur.execute(
                     """
@@ -588,14 +636,8 @@ class Pg:
                 )
         return len(rows)
 
-
-
-
     def upsert_tick_rows(self, symbol: str, rows: list[tuple[Any, ...]]) -> int:
-        """Insert tick rows into public.tick_data (canonical schema).
-
-        Returns inserted row count (best-effort via cursor.rowcount).
-        """
+        """Insert tick rows into public.tick_data (canonical schema)."""
         if not rows:
             return 0
 
@@ -623,12 +665,8 @@ class Pg:
                     pass
                 raise
 
-
     def upsert_ticks(self, rows: list[tuple[Any, ...]]) -> tuple[int, int, int]:
-        """Insert ticks and report (inserted, skipped, bad).
-
-        Rows are assumed already validated; therefore bad=0 here.
-        """
+        """Insert ticks and report (inserted, skipped, bad)."""
         if not rows:
             return (0, 0, 0)
         sym = str(rows[0][0]) if rows and rows[0] else None
@@ -675,9 +713,16 @@ def _run_daily_for_symbol(
 
     for a, b in ranges:
         LOG.info("[%s] DAILY %s → %s (clamped from %s)", symbol, a.isoformat(), b.isoformat(), eff_start.isoformat())
-        rows = poly.fetch_daily_bars(symbol, a, b)
-        LOG.info("[%s] daily rows=%d", symbol, len(rows))
+        try:
+            rows = poly.fetch_daily_bars(symbol, a, b)
+        except Exception as e:
+            days = (b - a).days + 1
+            st.failed_days += max(days, 1)
+            LOG.error("[%s] daily fetch failed for %s → %s: %s", symbol, a.isoformat(), b.isoformat(), e)
+            continue
+
         n = db.upsert_daily_rows(symbol, rows)
+        LOG.info("[%s] daily fetched=%d upserted=%d", symbol, len(rows), n)
         st.rows_upserted += n
         if commit_every <= 1:
             db.commit()
@@ -696,29 +741,35 @@ def _run_minute_for_symbol(
     force: bool,
 ) -> BackfillStats:
     st = BackfillStats()
+    t0 = time.time()
     missing_days, _present = _plan_missing_days(db, kind="minute", symbol=symbol, eff_start=eff_start, until=until, force=force)
     st.planned_days = len(db.get_expected_days("minute", eff_start, until))
     st.fetch_days = len(missing_days)
     st.skipped_days = st.planned_days - st.fetch_days
 
-    # Minute backfill: fetch per contiguous range (still safe because Polygon can return minutes in range)
     ranges = _chunks_contiguous(missing_days)
 
     for a, b in ranges:
         LOG.info("[%s] MINUTE %s → %s (clamped from %s)", symbol, a.isoformat(), b.isoformat(), eff_start.isoformat())
-        rows = poly.fetch_minute_bars(symbol, a, b)
-        LOG.info("[%s] minute rows=%d", symbol, len(rows))
+        try:
+            rows = poly.fetch_minute_bars(symbol, a, b)
+        except Exception as e:
+            days = (b - a).days + 1
+            st.failed_days += max(days, 1)
+            LOG.error("[%s] minute fetch failed for %s → %s: %s", symbol, a.isoformat(), b.isoformat(), e)
+            continue
+
         n = db.upsert_minute_rows(symbol, rows)
+        LOG.info("[%s] minute fetched=%d upserted=%d", symbol, len(rows), n)
         st.rows_upserted += n
         if commit_every <= 1:
             db.commit()
+    st.elapsed_sec = time.time() - t0
     return st
-
 
 
 def _normalize_polygon_trade_to_tick_row(symbol: str, tr: dict[str, Any]) -> Optional[tuple[Any, ...]]:
     """Map a Polygon v3 trade object into the canonical public.tick_data row tuple."""
-    # Extract a trade timestamp across Polygon variants (ns/us/ms/sec) and normalize to UTC.
     ts = extract_trade_ts_utc(tr)
     if ts is None:
         return None
@@ -727,7 +778,6 @@ def _normalize_polygon_trade_to_tick_row(symbol: str, tr: dict[str, Any]) -> Opt
     size = tr.get("size")
     if price is None or size is None:
         return None
-    # Some Polygon trades can have size=0; your DB enforces size>0 (tick_size_positive_chk).
     try:
         size_i = int(size)
     except Exception:
@@ -785,25 +835,20 @@ def _run_tick_for_symbol(
     st.fetch_days = len(missing_days)
     st.skipped_days = st.planned_days - st.fetch_days
 
-    # For ticks, Polygon v3 is day-scoped; fetch one day at a time.
-    # We keep memory bounded by batching inserts.
     BATCH = 5000
 
     for day in missing_days:
         try:
-            # Fast precheck to avoid wasting time fetching huge days that are already present.
-            # If the DB already has ANY ticks for this symbol+UTC day, skip Polygon fetch unless --force.
             if not force and db.has_tick_day(symbol, day):
                 LOG.info("[%s] TICK %s precheck hit — skipping Polygon fetch", symbol, day.isoformat())
-                st.skipped_days += 1
                 continue
             LOG.info("[%s] TICK %s", symbol, day.isoformat())
             batch: list[tuple[Any, ...]] = []
-            total_day = 0        # total Polygon trade dicts seen
-            in_bounds_day = 0    # trades inside NY-market-day bounds
+            total_day = 0
+            in_bounds_day = 0
             inserted_day = 0
-            bad_day = 0          # malformed trades (missing fields / timestamps)
-            oob_day = 0          # trades outside NY-market-day bounds
+            bad_day = 0
+            oob_day = 0
 
             day_start_utc, day_end_utc = market_day_bounds_utc(day)
 
@@ -867,6 +912,7 @@ def _run_tick_for_symbol(
                 pass
 
     return st
+
 
 def _append_run_log(
     repo_root: Path,
@@ -997,27 +1043,30 @@ def main(argv: list[str] | None = None) -> int:
     msg = ""
 
     try:
-        sym_list = db.get_symbol_list(args.symbol)
+        sym_list = db.get_symbol_list(args.symbol)  # (symbol, list_date, filters)
+
         # Resume pointer support (low-risk: only filters the symbol list)
         start_symbol = (args.start_symbol or args.start_at)
         start_after = args.start_after
         if start_symbol and start_after:
             raise ValueError("Use only one of --start-symbol / --start-after (or --start-at).")
         if start_symbol or start_after:
-            # Preserve list_date association while filtering by symbol
-            wanted = set(apply_start_symbol([s for (s, _ld) in sym_list], start_symbol, start_after))
-            sym_list = [(s, ld) for (s, ld) in sym_list if s in wanted]
+            wanted = set(apply_start_symbol([s for (s, _ld, _f) in sym_list], start_symbol, start_after))
+            sym_list = [(s, ld, f) for (s, ld, f) in sym_list if s in wanted]
             sym_list.sort(key=lambda x: x[0])
 
         LOG.info("Symbols: %d", len(sym_list))
 
-        for sym, list_date in sym_list:
+        for sym, list_date, filters in sym_list:
             eff_start = max(since, list_date) if list_date else since
+
+            # Tick-only archive clamp: ignore any tick planning/fetching < 2026-01-01 when flagged.
+            eff_start = _clamp_eff_start_for_tick_archive(args.kind, eff_start, filters)
+
             if until < eff_start:
                 continue
 
             if args.dry_run:
-                # Plan only
                 missing_days, present = _plan_missing_days(db, kind=args.kind, symbol=sym, eff_start=eff_start, until=until, force=args.force)
                 planned = len(db.get_expected_days(args.kind, eff_start, until))
                 LOG.info("[%s] plan kind=%s expected=%d present=%d missing=%d", sym, args.kind, planned, len(present), len(missing_days))
@@ -1040,10 +1089,8 @@ def main(argv: list[str] | None = None) -> int:
             total_rows += st.rows_upserted
 
             if args.commit_every > 1:
-                # keep existing semantics: commit occasionally (not implemented in this trimmed version)
                 pass
 
-        # final commit
         db.commit()
 
     except KeyboardInterrupt:
@@ -1103,7 +1150,6 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         db.close()
 
-    # Success log
     msg = f"planned={total_planned_days} fetch={total_fetch_days} skip={total_skipped_days} rows={total_rows}"
     _append_run_log(
         repo_root,
