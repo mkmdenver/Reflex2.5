@@ -58,7 +58,7 @@ class PortfolioManager:
     """Holds broker adapters keyed by account_id and produces normalized snapshots."""
 
     def __init__(self, instance: Optional[str] = None):
-        self.instance: str = instance or os.getenv("INSTANCE") or "liveA"
+        self.instance: str = instance or os.getenv("INSTANCE") or "live"
         self.adapters: Dict[str, Any] = {}
         self.portfolio: Dict[str, AccountSnapshot] = {}
         self._lock = __import__("asyncio").Lock()

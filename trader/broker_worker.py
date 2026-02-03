@@ -16,7 +16,7 @@
 #
 # Critical safety rules (enforced here):
 #   - Instance-scoped channels are mandatory:
-#       eval.order_intent.liveA
+#       eval.order_intent.live
 #       eval.order_intent.replay
 #   - If payload declares origin instance_id and it doesn't match this worker instance -> reject
 #   - If this Trader is LIVE and payload declares REPLAY -> reject
@@ -72,14 +72,14 @@ def _append_trader_event(evt: Dict[str, Any]) -> None:
 def _normalize_instance_id(instance: str) -> str:
     """
     Standardize instance ids:
-      - liveA (or 'live') -> liveA
-      - replay (or 'replayA') -> replay
+      - live (or 'live') -> live
+      - replay (or 'replay') -> replay
     """
     inst = (instance or "").strip()
     low = inst.lower()
-    if low in ("live", "livea"):
-        return "liveA"
-    if low in ("replay", "replaya"):
+    if low in ("live", "live"):
+        return "live"
+    if low in ("replay", "replay"):
         return "replay"
     return inst
 

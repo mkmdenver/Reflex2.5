@@ -1,72 +1,110 @@
-# trader/trade_runner.py
-# v2.2.0 — Soft-exit-first TradeRunner (premarket/postmarket safe)
-#
-# Philosophy (matches system spec):
-#   - Normal operation = *soft exits* driven by ticks/NBBO (especially premarket).
-#   - Broker stops may be used sparingly as an extra layer, but are NOT required.
-#   - On entry fill, compute stop + target immediately (default rule: +10c / -5c).
-#   - When price crosses stop/target, submit a marketable LIMIT exit.
-#   - If the limit doesn't fill quickly (or gets blown past), cancel + re-place
-#     at a more aggressive marketable price.
-#
-# This file is intentionally KISS: minimal state machine, no fancy abstractions.
+"""
+Trade Runner Module
 
-from __future__ import annotations
+Manages the lifecycle of trades from entry through exit, including:
+- Entry order submission and fill detection
+- Soft stop/target monitoring and exit execution
+- Position reconciliation with broker state
+- Metrics collection (TSLFE - Time Since Last Fill Engine)
+- Broker-side protective orders
+- Market data tier raising for active symbols
+- Persistent event logging (JSONL format)
+
+Key Components:
+    - TradeRunner: Main orchestrator handling trade state machines
+    - _TSLFE: Placeholder metrics engine for time-to-breakeven tracking
+    - Helper functions: MD reading, side detection, price computation, etc.
+
+Environment Configuration:
+    TRADER_TRADE_RUNNER_ENABLED: Enable/disable runner (default: 1)
+    TRADER_EXIT_AGGRESS_CENTS: Aggressiveness for exit orders (default: 3.0)
+    TRADER_ENTRY_AGGRESS_CENTS: Aggressiveness for entry orders (default: 2.0)
+    TRADER_FILL_TIMEOUT_S: Entry fill timeout (default: 20s)
+    TRADER_EXIT_FILL_TIMEOUT_S: Exit fill timeout (default: 15s)
+    TRADER_BROKER_PROTECT_ENABLED: Enable broker protective orders (default: 0)
+    TRADER_BROKER_PROTECT_ONLY_RTH: Protective orders only in RTH (default: 1)
+    TRADER_BROKER_PROTECT_STOP_TYPE: Stop type for protection (default: "stop")
+    TRADER_BROKER_PROTECT_TAKE_PROFIT: Enable protective take-profit (default: 0)
+    TRADER_BROKER_PROTECT_TIF: Time-in-force for protective orders (default: "day")
+    TRADER_ORDERS_LOG_PATH: Path to JSONL order log (default: "logs/orders.log")
+    TRADER_TSLFE_ENABLED: Enable TSLFE metrics (default: 0)
+    TRADER_TSLFE_EPS_PRICE: TSLFE epsilon price (default: 0.01)
+    TRADER_TSLFE_TBE_WINDOW: TSLFE time-to-breakeven window (default: 25)
+    TRADER_TSLFE_MIN_SAMPLES: TSLFE minimum samples (default: 8)
+    TRADER_TSLFE_FLATTEN_TH: TSLFE flatten threshold (default: 2.6)
+    TRADER_TSLFE_PROFIT_EXIT_NORM_TH: TSLFE profit exit normalization threshold (default: 2.0)
+    TRADER_EXIT_MODEL_DEFAULT: Default exit model (default: "stop")
+    TRADER_METRICS_EMIT_SECS: Metrics emission cadence (default: 2s)
+    MARKET_SESSION: Market session type (RTH, PRE, POST)
+    REFLEX_INSTANCE_ID / INSTANCE: Instance identifier for logging
+    REFLEX_MODE: Execution mode (LIVE, REPLAY, etc.)
+    TIERS_CMD_Q: DataHub queue for tier raise commands
+
+Trade State Machine:
+    NEW/ADOPTED -> ACTIVE: Adopt existing position without entry order
+    ENTRY_PENDING -> ENTRY_SUBMITTED -> ACTIVE: Place and fill entry order
+    ACTIVE -> EXIT_SUBMITTED -> DONE: Monitor stops/targets and exit
+    *STATE* -> ERROR: Error handling with trace capture
+    EXIT_SUBMITTED -> EXIT_SUBMITTED (chased): Escalate exit aggressiveness on timeout
+
+Event Logging:
+    All state changes and order events written to JSONL with full context:
+    - Timestamps (wall-clock, engine-clock, nanosecond precision, ISO UTC/ET)
+    - Trade identifiers and order IDs
+    - Market data and decision prices
+    - Position quantities and fill prices
+    - Latencies and execution metrics
+"""
 
 import asyncio
 import json
-import logging
+import math
 import os
 import time
 import traceback
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
-
-try:
-    import redis.asyncio as aioredis  # type: ignore
-except Exception:  # pragma: no cover
-    aioredis = None  # type: ignore
+from typing import Any, Dict, Optional, Tuple, List
 
 try:
     from zoneinfo import ZoneInfo
-except Exception:  # pragma: no cover
-    ZoneInfo = None  # type: ignore
+except ImportError:
+    ZoneInfo = None
 
-log = logging.getLogger("trader.trade_runner")
-
-# Runtime sanity check: ensure you are editing the file that is actually executing.
-print("### TRADE_RUNNER LOADED FROM:", __file__)
-
-
-# DataHub tier control (Trader -> DataHub): ensure symbols we are trading are
-# subscribed for ticks/quotes so soft exits can actually trigger.
 try:
-    from common.bus import CHANNELS, publisher, pack
-except Exception:  # pragma: no cover
-    CHANNELS = {}  # type: ignore
-    publisher = None  # type: ignore
-    pack = None  # type: ignore
+    from reflex_shared.adapters.base import publisher, pack
+except ImportError:
+    publisher = None
+    pack = None
 
+# Assuming engine_clock and log are available from another module
+try:
+    from reflex_shared import engine_clock, log
+except ImportError:
+    import logging
+    log = logging.getLogger(__name__)
+    class _EngineClock:
+        def now(self):
+            return time.time()
+    engine_clock = _EngineClock()
 
-def _truthy(name: str, default: str = "0") -> bool:
-    v = str(os.getenv(name, default)).strip().lower()
-    return v in ("1", "true", "yes", "y", "on")
-
-
-def _as_float(x: Any) -> Optional[float]:
+def _as_float(val: Any) -> Optional[float]:
+    """Helper to safely convert any value to float."""
     try:
-        if x is None:
+        if val is None:
             return None
-        if isinstance(x, bool):
-            return None
-        return float(x)
-    except Exception:
+        return float(val)
+    except (TypeError, ValueError):
         return None
+
+def _truthy(env_var: str, default: str) -> bool:
+    """Helper to parse truthy environment variables."""
+    val = (os.getenv(env_var) or default).strip().lower()
+    return val in ("true", "1", "yes", "on")
 
 
 def _now() -> float:
-    return time.time()
+    return engine_clock.now()
 
 
 def _ts_fields() -> Dict[str, Any]:
@@ -89,7 +127,7 @@ def _ts_fields() -> Dict[str, Any]:
     except Exception:
         iso_et = iso_utc
 
-    return {"ts": ts, "ts_ns": ts_ns, "iso_utc": iso_utc, "iso_et": iso_et}
+    return {"ts": ts, "engine_ts": _now(), "ts_ns": ts_ns, "iso_utc": iso_utc, "iso_et": iso_et}
 
 
 def _ensure_parent_dir(path: str) -> None:
@@ -126,6 +164,52 @@ def _exit_client_id(trade_id: str, reason: str, seq: int) -> str:
     # Stable prefix so UI can group orders for a trade
     base = (trade_id or "trade").strip()
     return f"{base}:exit:{reason}:{seq}"
+
+
+def _parse_stop_cents(model: Dict[str, Any]) -> Optional[float]:
+    """Return stop cents from a canonical stop model.
+
+    Supports:
+      - kind like "5pt_hard" (digits prefix)
+      - params.cents
+    """
+    try:
+        kind = str((model or {}).get("kind") or "").strip().lower()
+        params = (model or {}).get("params") if isinstance((model or {}).get("params"), dict) else {}
+        if isinstance(params, dict):
+            c = params.get("cents")
+            if c is not None:
+                return float(c)
+        if "pt" in kind:
+            # e.g. "5pt_hard" -> 5
+            prefix = kind.split("pt", 1)[0]
+            if prefix.isdigit():
+                return float(prefix)
+        return None
+    except Exception:
+        return None
+
+
+def _parse_profit_cents(model: Dict[str, Any]) -> Optional[float]:
+    """Return profit target cents for a profit model.
+
+    Supported minimal set:
+      - kind "fixed_cents" with params.cents
+      - kind "tslfe" (defaults to 10 cents; override via params.cents)
+    """
+    try:
+        kind = str((model or {}).get("kind") or "").strip().lower()
+        params = (model or {}).get("params") if isinstance((model or {}).get("params"), dict) else {}
+        cents = None
+        if isinstance(params, dict):
+            cents = params.get("cents")
+        if cents is not None:
+            return float(cents)
+        if kind == "tslfe":
+            return 10.0
+        return None
+    except Exception:
+        return None
 
 
 def _marketable_limit_price(kind: str, side: str, lt: Optional[float], bid: Optional[float], ask: Optional[float], aggress_cents: float) -> Optional[float]:
@@ -271,7 +355,7 @@ class TradeRunner:
         self.adapters = adapters
         self.pm = portfolio_manager
 
-        self.instance_id = os.getenv("REFLEX_INSTANCE_ID") or os.getenv("INSTANCE") or "liveA"
+        self.instance_id = os.getenv("REFLEX_INSTANCE_ID") or os.getenv("INSTANCE") or "live"
         self.mode = os.getenv("REFLEX_MODE") or "LIVE"
 
         self.exit_aggress_cents = float(os.getenv("TRADER_EXIT_AGGRESS_CENTS", "3.0") or 3.0)
@@ -291,6 +375,12 @@ class TradeRunner:
         # Independent, append-only order/event log (JSONL). Every state change writes a line.
         self._orders_log_path = (os.getenv("TRADER_ORDERS_LOG_PATH", "logs/orders.log") or "logs/orders.log").strip()
         _ensure_parent_dir(self._orders_log_path)
+
+        # Concise per-trade close log (JSONL): one line per CLOSED trade for research.
+        self._trade_log_enable = _truthy("TRADER_TRADE_LOG_ENABLE", "0")
+        self._trade_log_path = (os.getenv("TRADER_TRADE_LOG_PATH", "logs/trades_closed.jsonl") or "logs/trades_closed.jsonl").strip()
+        if self._trade_log_enable:
+            _ensure_parent_dir(self._trade_log_path)
 
         # Auto tier raise so DataHub streams ticks/quotes for symbols in-trade.
         # Without this, md_worker won't see live ticks and soft exits won't trigger.
@@ -336,6 +426,8 @@ class TradeRunner:
             # Core identifiers
             rec["trade_id"] = t.get("trade_id")
             rec["state"] = t.get("state")
+            rec["gen_id"] = t.get("gen_id")
+            rec["intent_mode"] = t.get("intent_mode")
             rec["account_id"] = t.get("account_id")
             rec["symbol"] = t.get("symbol")
             rec["side_kind"] = (str(t.get("side") or "buy").lower() == "sell" and "short") or "long"
@@ -389,6 +481,72 @@ class TradeRunner:
             pass
 
 
+    def _write_trade_close_log(self, t: Dict[str, Any]) -> None:
+        """Write one concise JSONL line per trade closure (research-friendly).
+
+        This is intentionally best-effort and must never impact execution.
+        """
+        if not getattr(self, "_trade_log_enable", False):
+            return
+        if t.get("_trade_close_logged"):
+            return
+        try:
+            # Prefer broker-confirmed exit fields if available
+            rec: Dict[str, Any] = {}
+            rec.update(_ts_fields())
+            rec["event"] = "TRADE_CLOSE"
+
+            rec["trade_id"] = t.get("trade_id")
+            rec["account_id"] = t.get("account_id")
+            rec["symbol"] = t.get("symbol")
+            rec["gen_id"] = t.get("gen_id")
+            rec["intent_mode"] = t.get("intent_mode")
+            rec["market_session"] = t.get("market_session")
+
+            rec["side"] = t.get("side")
+            rec["qty"] = t.get("qty")
+
+            # Prices / economics
+            rec["entry_price"] = t.get("entry_avg_price") or t.get("entry_fill_price") or t.get("entry_first_fill_price")
+            rec["exit_price"] = t.get("exit_fill_price") or t.get("exit_avg_fill_price") or t.get("exit_first_fill_price")
+            rec["realized_pl"] = t.get("realized_pl")
+
+            # Lifecycle times (best effort)
+            entry_ts = t.get("entry_filled_ts") or t.get("entry_first_fill_ts") or t.get("entry_submitted_ts")
+            exit_ts = t.get("exit_filled_ts") or t.get("exit_first_fill_ts") or t.get("exit_submitted_ts")
+            rec["entry_ts"] = entry_ts
+            rec["exit_ts"] = exit_ts
+
+            # Duration in seconds (only if both look numeric epoch-ish)
+            try:
+                e = _as_float(entry_ts)
+                x = _as_float(exit_ts)
+                if e is not None and x is not None and x >= e:
+                    rec["hold_s"] = round(x - e, 6)
+            except Exception:
+                pass
+
+            # Models + reason (UI-verbatim)
+            rec["close_reason"] = t.get("close_reason") or t.get("exit_reason")
+            rec["exit_reason_hint"] = t.get("exit_reason_hint")
+            rec["entry_model"] = t.get("entry_model")
+            rec["profit_model"] = t.get("profit_model")
+            rec["stop_loss_model"] = t.get("stop_loss_model")
+            rec["position_mgmt_model"] = t.get("position_mgmt_model")
+
+            # Compact latency metrics (if present)
+            rec["entry_fill_latency_ms"] = t.get("entry_fill_latency_ms")
+            rec["submit_to_ack_ms"] = t.get("submit_to_ack_ms")
+            rec["ack_to_first_fill_ms"] = t.get("ack_to_first_fill_ms")
+            rec["first_fill_to_done_ms"] = t.get("first_fill_to_done_ms")
+
+            line = json.dumps(rec, ensure_ascii=False, separators=(",", ":"))
+            with open(self._trade_log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+            t["_trade_close_logged"] = True
+        except Exception:
+            pass
+
     def _persist(self, t: Dict[str, Any], event_type: str, extra: Optional[Dict[str, Any]] = None) -> None:
         # Always write the independent log first so we capture even if downstream throws.
         self._write_orders_log(t, event_type, extra)
@@ -415,6 +573,117 @@ class TradeRunner:
             pass
 
     # -------------- Journaling / storage helpers -----------------------------
+
+    async def _finalize_close(self, aid: str, adapter: Any, t: Dict[str, Any]) -> None:
+        """Populate close bookkeeping fields once the broker position is gone.
+
+        This is intentionally best-effort: it must never throw or block the runner.
+        Fields set (if available):
+          - exit_fill_price
+          - exit_filled_ts (ISO string)
+          - realized_pl
+          - close_reason (model-aware string for UI)
+        """
+        try:
+            # Do not recompute if already finalized
+            if t.get("exit_filled_ts") and t.get("exit_fill_price") is not None and t.get("realized_pl") is not None and t.get("close_reason"):
+                return
+        except Exception:
+            pass
+
+        # ---- Close reason (model-aware) ---------------------------------
+        try:
+            er = str(t.get("exit_reason") or "").upper()
+            hint = str(t.get("exit_reason_hint") or "").strip()
+            close_reason = ""
+            if er in ("SOFT_STOP", "STOP"):
+                close_reason = "STOP" + (f":{hint}" if hint else "")
+            elif er in ("SOFT_TARGET", "TARGET"):
+                close_reason = "TARGET" + (f":{hint}" if hint else "")
+            elif er:
+                close_reason = er + (f":{hint}" if hint else "")
+            else:
+                close_reason = "CLOSED"
+            t["close_reason"] = close_reason
+        except Exception:
+            t["close_reason"] = t.get("close_reason") or "CLOSED"
+
+        # ---- Find best exit order + fill price/time ----------------------
+        try:
+            exit_oid = str(t.get("exit_order_id") or "")
+            exit_cid = str(t.get("exit_client_order_id") or "")
+            orders: List[Dict[str, Any]] = []
+            fn = getattr(adapter, "list_recent_orders", None)
+            if fn is not None:
+                orders = await _maybe_await(fn, status="all", limit=200)  # type: ignore[arg-type]
+            best = None
+            if isinstance(orders, list) and orders:
+                for o in orders:
+                    try:
+                        if not isinstance(o, dict):
+                            continue
+                        oid = str(o.get("id") or o.get("order_id") or "")
+                        cid = str(o.get("client_order_id") or "")
+                        if exit_oid and oid == exit_oid:
+                            best = o; break
+                        if exit_cid and cid == exit_cid:
+                            best = o; break
+                    except Exception:
+                        continue
+                # If we did not match by id, fall back to most recent filled exit-looking order for this trade
+                if best is None and (exit_cid or exit_oid):
+                    # trade id prefix is the first token of our client ids
+                    trade_prefix = (exit_cid.split(":")[0] if exit_cid else "")
+                    candidates = []
+                    for o in orders:
+                        if not isinstance(o, dict):
+                            continue
+                        cid = str(o.get("client_order_id") or "")
+                        if trade_prefix and cid.startswith(trade_prefix) and ":exit:" in cid:
+                            candidates.append(o)
+                    def _ord_ts(o: Dict[str, Any]) -> str:
+                        return str(o.get("filled_at") or o.get("updated_at") or o.get("submitted_at") or o.get("created_at") or "")
+                    candidates.sort(key=_ord_ts, reverse=True)
+                    best = candidates[0] if candidates else None
+
+            if isinstance(best, dict):
+                # price
+                px_raw = best.get("filled_avg_price")
+                if px_raw is None or px_raw == "":
+                    px_raw = best.get("avg_fill_price")
+                if px_raw is None or px_raw == "":
+                    px_raw = best.get("limit_price")
+                try:
+                    px = float(px_raw) if px_raw is not None and px_raw != "" else None
+                    if px is not None and math.isfinite(px):
+                        t["exit_fill_price"] = px
+                except Exception:
+                    pass
+
+                ts_raw = best.get("filled_at") or best.get("updated_at") or best.get("submitted_at") or best.get("created_at")
+                if ts_raw:
+                    t["exit_filled_ts"] = str(ts_raw)
+        except Exception:
+            pass
+
+        # ---- Realized P/L ------------------------------------------------
+        try:
+            qty = float(_as_float(t.get("qty")) or 0.0)
+            entry_px = float(_as_float(t.get("entry_avg_price")) or 0.0)
+            exit_px = float(_as_float(t.get("exit_fill_price")) or 0.0)
+            if qty and entry_px and exit_px:
+                # Long-only for now; if we add shorts later we can branch on side/kind.
+                t["realized_pl"] = (exit_px - entry_px) * qty
+        except Exception:
+            pass
+
+        # Ensure timestamps exist for UI even if we could not read broker order history
+        try:
+            if not t.get("exit_filled_ts"):
+                t["exit_filled_ts"] = _ts_fields().get("iso_utc")
+        except Exception:
+            pass
+
 
     def journal_append(self, kind: str, obj: Dict[str, Any]) -> None:
         try:
@@ -1010,6 +1279,42 @@ class TradeRunner:
 
         # ---- ENTRY_PENDING -> place order ----
         if st == "ENTRY_PENDING":
+            # Unified trigger gating (LIVE + REPLAY):
+            # - kind=now: eligible immediately
+            # - kind=at_time: eligible when engine clock reaches ts
+            try:
+                trig = t.get("trigger") if isinstance(t.get("trigger"), dict) else {}
+                kind_t = str((trig or {}).get("kind") or "now").strip().lower()
+                if kind_t == "at_time":
+                    ts_epoch = (trig or {}).get("ts_epoch")
+                    params = (trig or {}).get("params") if isinstance((trig or {}).get("params"), dict) else {}
+                    tol_ms = int((params or {}).get("tolerance_ms") or 500)
+                    late_action = str((params or {}).get("late_action") or "execute").strip().lower()
+                    if late_action not in ("execute", "skip", "expire"):
+                        late_action = "execute"
+                    now = _now()
+                    if ts_epoch is None:
+                        # Bad trigger ts; fall back to immediate
+                        pass
+                    else:
+                        if now < float(ts_epoch):
+                            # Not yet
+                            self._persist(t, "TRADE_TRIGGER_WAIT", extra={"trigger_ts": (trig or {}).get("ts"), "ts_epoch": ts_epoch})
+                            return
+                        late_ms = int((now - float(ts_epoch)) * 1000.0)
+                        if late_ms > tol_ms:
+                            if late_action in ("skip", "expire"):
+                                t["state"] = "DONE"
+                                t["exit_reason"] = "INTENT_EXPIRED"
+                                self._persist(t, "TRADE_INTENT_EXPIRED", extra={"late_ms": late_ms, "tolerance_ms": tol_ms, "late_action": late_action})
+                                return
+                            # execute (but note lateness)
+                            t["trigger_late_ms"] = late_ms
+                            self._persist(t, "TRADE_TRIGGER_LATE", extra={"late_ms": late_ms, "tolerance_ms": tol_ms})
+            except Exception:
+                # Never block entry on trigger parsing issues.
+                pass
+
             sess = str(t.get("market_session") or _session_kind_now())
             extended = sess in ("PRE", "POST")
 
@@ -1107,12 +1412,21 @@ class TradeRunner:
                 if entry_price <= 0:
                     entry_price = float(px or 0.0) or 0.0
 
+                # Compute stop/target from intent models (reflex.intent.v3)
+                models = t.get("models") if isinstance(t.get("models"), dict) else {}
+                stop_cents = _parse_stop_cents((models or {}).get("stop") or {}) or 5.0
+                profit_cents = _parse_profit_cents((models or {}).get("profit") or {})
+                if profit_cents is None:
+                    profit_cents = 10.0
+                stop_d = float(stop_cents) / 100.0
+                prof_d = float(profit_cents) / 100.0
+
                 if kind == "long":
-                    soft_stop = max(0.01, entry_price - 0.05)
-                    soft_target = max(0.01, entry_price + 0.10)
+                    soft_stop = max(0.01, entry_price - stop_d)
+                    soft_target = max(0.01, entry_price + prof_d)
                 else:
-                    soft_stop = max(0.01, entry_price + 0.05)
-                    soft_target = max(0.01, entry_price - 0.10)
+                    soft_stop = max(0.01, entry_price + stop_d)
+                    soft_target = max(0.01, entry_price - prof_d)
 
                 t["soft_stop_price"] = _safe_round(soft_stop)
                 t["soft_target_price"] = _safe_round(soft_target)
@@ -1158,12 +1472,21 @@ class TradeRunner:
             if entry_price <= 0:
                 entry_price = float(fill_price or 0.0) or 0.0
 
+            # Compute stop/target from intent models (reflex.intent.v3)
+            models = t.get("models") if isinstance(t.get("models"), dict) else {}
+            stop_cents = _parse_stop_cents((models or {}).get("stop") or {}) or 5.0
+            profit_cents = _parse_profit_cents((models or {}).get("profit") or {})
+            if profit_cents is None:
+                profit_cents = 10.0
+            stop_d = float(stop_cents) / 100.0
+            prof_d = float(profit_cents) / 100.0
+
             if kind == "long":
-                soft_stop = max(0.01, entry_price - 0.05)
-                soft_target = max(0.01, entry_price + 0.10)
+                soft_stop = max(0.01, entry_price - stop_d)
+                soft_target = max(0.01, entry_price + prof_d)
             else:
-                soft_stop = max(0.01, entry_price + 0.05)
-                soft_target = max(0.01, entry_price - 0.10)
+                soft_stop = max(0.01, entry_price + stop_d)
+                soft_target = max(0.01, entry_price - prof_d)
 
             t["soft_stop_price"] = _safe_round(soft_stop)
             t["soft_target_price"] = _safe_round(soft_target)
@@ -1201,8 +1524,13 @@ class TradeRunner:
             if (not pos) or abs(float(_as_float(pos.get("qty")) or 0.0)) < 1e-9:
                 if t.get("pos_seen"):
                     if t.get("state") != "DONE":
+                        try:
+                            await self._finalize_close(aid, adapter, t)
+                        except Exception:
+                            pass
                         t["state"] = "DONE"
                         self._persist(t, "TRADE_DONE", extra={"reason": "broker_position_closed"})
+                        self._write_trade_close_log(t)
                 else:
                     self._persist(t, "TRADE_WAITING_FOR_POSITION", extra={"reason": "snapshot_missing_position"})
                 return

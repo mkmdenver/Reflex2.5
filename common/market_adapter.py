@@ -2,18 +2,18 @@
 from __future__ import annotations
 from typing import Iterable, List, Literal, Dict, Any
 
-from datahub.adapters.live_adapter import LIVEAdapter
+from datahub.adapters.live_adapter import livedapter
 
 Event = Dict[str, Any]
 Kind = Literal["trades", "quotes"]
 
 class MarketAdapter:
     """
-    Concrete, operational adapter: thin wrapper over LIVEAdapter.
+    Concrete, operational adapter: thin wrapper over livedapter.
     No stubs. No abstract methods.
     """
     def __init__(self, api_key: str | None = None, ws_url: str | None = None):
-        self._impl = LIVEAdapter(api_key=api_key, ws_url=ws_url)
+        self._impl = livedapter(api_key=api_key, ws_url=ws_url)
 
     def open(self) -> None:
         self._impl.start()
@@ -30,7 +30,7 @@ class MarketAdapter:
         self._impl.subscribe(trades=trades, quotes=quotes)
 
     def stream(self) -> Iterable[Event]:
-        # Delegate to LIVEAdapter’s stream generator if present,
+        # Delegate to livedapter’s stream generator if present,
         # otherwise use its WS client iterator.
         if hasattr(self._impl, "stream"):
             yield from self._impl.stream()

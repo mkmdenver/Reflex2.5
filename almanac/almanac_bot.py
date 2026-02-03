@@ -39,7 +39,7 @@ def main() -> int:
     load_dotenv(os.path.join(repo_root, ".env"))
 
     target = os.getenv("WATCH_SYMBOLS", "ALL")  # cheap default for now
-    universe_name = os.getenv("REFLEX_INSTANCE_ID", "liveA")
+    universe_name = os.getenv("REFLEX_INSTANCE_ID", "live")
     poll_secs = int(os.getenv("REFLEX_POLL_SECS", "30"))
 
     cfg = AlmanacConfig(

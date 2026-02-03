@@ -92,7 +92,7 @@ Reflex 2.4 supports two run modes:
 
 ### Key `.env` Variables
 - `REFLEX_MODE`: LIVE or REPLAY
-- `REFLEX_INSTANCE_ID`: e.g. `liveA`, `replayB`
+- `REFLEX_INSTANCE_ID`: e.g. `live`, `replayB`
 - `REDIS_URL`: always use local Redis or Garnet
 - `REFLEX__PG_DSN`: TimescaleDB tick/fundamental store
 - `REFLEX_BROKER_DSN`: Broker account + position DB

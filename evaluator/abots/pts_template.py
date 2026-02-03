@@ -23,7 +23,7 @@ Date selection:
 Env used:
     REFLEX__PG_DSN          : Postgres DSN
     REFLEX__PARQUET_ROOT    : base parquet root (e.g. D:\reflex_parquet)
-    REFLEX__INSTANCE_NAME   : instance name (e.g. liveA) [optional, default liveA]
+    REFLEX__INSTANCE_NAME   : instance name (e.g. live) [optional, default live]
     REFLEX__RUN_ID          : run id tag (default 'dev')
 """
 
@@ -63,13 +63,13 @@ def build_parquet_root() -> Path:
     Build parquet root path from env:
 
         REFLEX__PARQUET_ROOT      e.g. D:\\reflex_parquet
-        REFLEX__INSTANCE_NAME     e.g. liveA (default)
+        REFLEX__INSTANCE_NAME     e.g. live (default)
 
     Final path:
         {REFLEX__PARQUET_ROOT}\\instances\\{INSTANCE}
     """
     base = Path(get_env("REFLEX__PARQUET_ROOT"))
-    instance = os.getenv("REFLEX__INSTANCE_NAME", "liveA")
+    instance = os.getenv("REFLEX__INSTANCE_NAME", "live")
     return base / "instances" / instance
 
 

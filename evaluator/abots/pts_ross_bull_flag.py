@@ -135,7 +135,7 @@ def resolve_parquet_root() -> Path:
     Prefer REFLEX_STORAGE_PARQUET_ROOT, then PARQUET_ROOT.
 
     In your .env today we have:
-        REFLEX_STORAGE_PARQUET_ROOT=D:\\reflex_parquet\\instances\\liveA
+        REFLEX_STORAGE_PARQUET_ROOT=D:\\reflex_parquet\\instances\\live
         PARQUET_ROOT=D:\\market
     """
     for key in ("REFLEX_STORAGE_PARQUET_ROOT", "PARQUET_ROOT"):
@@ -1235,7 +1235,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         print(f"[WARN] No symbols matched pattern '{symbol_pattern}' under {parquet_root}")
         return
 
-    instance = os.getenv("REFLEX_INSTANCE_ID", "liveA")
+    instance = os.getenv("REFLEX_INSTANCE_ID", "live")
 
     print(f"[INFO] RUN_ID={RUN_ID}")
     print(f"[INFO] INSTANCE={instance}")

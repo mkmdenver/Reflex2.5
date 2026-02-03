@@ -34,6 +34,7 @@ except Exception:  # pragma: no cover
 
 from common.bus import subscribe, unpack, CHANNELS
 from .core import get_logger, get_instance_id, get_redis_url
+from . import engine_clock
 
 log = get_logger("trader.md")
 
@@ -68,7 +69,7 @@ def _truthy(v: Optional[str]) -> bool:
 
 
 def _key_prefix(instance_id: str) -> str:
-    # Example: reflex:liveA:md
+    # Example: reflex:live:md
     tpl = os.getenv("TRADER_MD_KEY_PREFIX", "reflex:{instance_id}:md")
     return tpl.format(instance_id=instance_id).rstrip(":")
 
@@ -97,7 +98,7 @@ def _coerce_int(x: Any) -> Optional[int]:
 
 async def _maybe_write_state(r: Any, prefix: str, st: MarketState) -> None:
     # Write a single JSON blob per symbol (easy to inspect).
-    # key = reflex:liveA:md:SPY
+    # key = reflex:live:md:SPY
     if not r:
         return
     key = f"{prefix}:{st.symbol.upper()}"
@@ -139,6 +140,45 @@ def _parse_quote(payload: Dict[str, Any]) -> Optional[LastQuote]:
     ts = _coerce_float(payload.get("ts")) or _coerce_float(payload.get("t")) or _now()
     return LastQuote(ts=float(ts), bid=bid, ask=ask, bid_size=bid_size, ask_size=ask_size)
 
+
+def _parse_bar(payload: Dict[str, Any]) -> Optional[float]:
+    """Return bar timestamp in seconds since epoch if present."""
+    try:
+        ts = _coerce_float(payload.get("ts")) or _coerce_float(payload.get("t"))
+        return float(ts) if ts is not None else None
+    except Exception:
+        return None
+
+
+async def _listen_clock(channel: str) -> None:
+    """Listen for replay clock pulses and advance engine_clock.
+
+    Expected payload shapes (flexible):
+      - {"t": <epoch_seconds>} or {"ts": <epoch_seconds>}
+      - {"payload": {"t": ...}} (enveloped)
+    """
+    ps = await subscribe(channel)
+    log.info("md_worker.listen.start", extra={"channel": channel, "kind": "clock"})
+    async for msg in ps.listen():  # type: ignore[attr-defined]
+        if msg.get("type") != "message":
+            continue
+        raw = msg.get("data")
+        try:
+            env = unpack(raw)
+        except Exception:
+            try:
+                env = json.loads(raw) if isinstance(raw, (bytes, str)) else raw
+            except Exception:
+                env = None
+        if not isinstance(env, dict):
+            continue
+        payload = env.get("payload") if isinstance(env.get("payload"), dict) else env
+        if not isinstance(payload, dict):
+            continue
+        ts = _coerce_float(payload.get("t")) or _coerce_float(payload.get("ts"))
+        if ts is None:
+            continue
+        engine_clock.set_engine_now(float(ts))
 
 async def _listen_channel(
     channel: str,
@@ -186,11 +226,27 @@ async def _listen_channel(
             if t:
                 st.last_trade = t
                 updated = True
+                try:
+                    engine_clock.set_engine_now(float(t.ts))
+                except Exception:
+                    pass
         elif kind == "quote":
             q = _parse_quote(payload)
             if q:
                 st.last_quote = q
                 updated = True
+                try:
+                    engine_clock.set_engine_now(float(q.ts))
+                except Exception:
+                    pass
+        elif kind == "bar":
+            tsb = _parse_bar(payload)
+            if tsb is not None:
+                updated = True
+                try:
+                    engine_clock.set_engine_now(float(tsb))
+                except Exception:
+                    pass
 
         if updated:
             st.updated_ts = _now()
@@ -221,6 +277,11 @@ async def run() -> int:
     # listens only to the legacy channels, it can go blind (no md keys).
     ticks_ch = CHANNELS.get("ticks_live", CHANNELS.get("ticks", "hub.ticks"))
     quotes_ch = CHANNELS.get("quotes_live", CHANNELS.get("quotes", "hub.quotes"))
+    bars_ch = CHANNELS.get("bars_live", CHANNELS.get("bars", "hub.bars"))
+
+    # Optional replay clock pulses (Option B). If present, Trader time-gating uses these.
+    clock_ch_tpl = (os.getenv("REPLAY_CLOCK_CHANNEL") or os.getenv("TRADER_REPLAY_CLOCK_CHANNEL") or "replay.clock.{instance_id}").strip()
+    clock_ch = clock_ch_tpl.format(instance_id=instance)
 
     enable_cache = _truthy(os.getenv("TRADER_MD_ENABLE_REDIS_CACHE", "1"))
     r = None
@@ -238,6 +299,8 @@ async def run() -> int:
     tasks = [
         asyncio.create_task(_listen_channel(ticks_ch, "tick", states, r, key_prefix)),
         asyncio.create_task(_listen_channel(quotes_ch, "quote", states, r, key_prefix)),
+        asyncio.create_task(_listen_channel(bars_ch, "bar", states, r, key_prefix)),
+        asyncio.create_task(_listen_clock(clock_ch)),
         asyncio.create_task(_report_loop(states, report_every)),
     ]
 
@@ -247,6 +310,8 @@ async def run() -> int:
             "instance": instance,
             "ticks": ticks_ch,
             "quotes": quotes_ch,
+            "bars": bars_ch,
+            "clock": clock_ch,
             "redis_cache": bool(r),
             "key_prefix": key_prefix,
         },

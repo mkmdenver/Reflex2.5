@@ -24,8 +24,8 @@ def make_adapter(mode: str):
         return ReplayAdapter()
 
     # LIVE
-    from .live_adapter import LIVEAdapter
+    from .live_adapter import livedapter
     api_key = os.getenv("POLYGON_API_KEY") or os.getenv("POLYGON_KEY")
     ws_url  = os.getenv("POLYGON_WS_URL", "wss://socket.polygon.io/stocks")
-    # Only pass args that LIVEAdapter actually supports
-    return _construct(LIVEAdapter, api_key=api_key, ws_url=ws_url)
+    # Only pass args that livedapter actually supports
+    return _construct(livedapter, api_key=api_key, ws_url=ws_url)

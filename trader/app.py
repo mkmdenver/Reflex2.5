@@ -1,12 +1,5 @@
 # trader/app.py
-# v2.1.2 – Trader HTTP API + telemetry plumbing (ACK/FILL instrumentation)
-#
-# v2.1.2:
-#   - Add compatibility endpoints for BrokerView:
-#       /v1/portfolio/overview
-#       /v1/portfolio/positions?account_id=...
-#       /v1/accounts
-#   - Keep TradeRunner constructor signature fix (store/alerts/adapters/portfolio_manager).
+
 
 import os
 import time
@@ -14,6 +7,11 @@ import asyncio
 import logging
 import threading
 from datetime import datetime, timezone
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
+
 from typing import Dict, Any, Optional, List, Deque
 from collections import deque as _deque
 from uuid import uuid4
@@ -23,6 +21,8 @@ from fastapi.responses import JSONResponse
 from .portfolio_manager import PortfolioManager
 from .alpaca_trade_updates import listen_trade_updates
 from .trade_runner import TradeRunner
+
+from datetime import timezone as _tz
 
 log = logging.getLogger("trader.app")
 app = FastAPI(title="Reflex Trader API", version="2.1.2")
@@ -183,6 +183,108 @@ def _default_bot_qty() -> float:
     except Exception:
         return 1.0
 
+
+# ---------------------------------------------------------------------------
+# Intent v3 normalization (reflex.intent.v3)
+# ---------------------------------------------------------------------------
+
+def _coerce_model(x: Any, *, default_kind: str) -> Dict[str, Any]:
+    """Return {kind, params} from either a string or a dict.
+
+    Legacy emitters may send:
+      - "tslfe"                (string)
+      - {"kind": "tslfe", ...} (dict)
+      - {"model": "tslfe"}    (dict)
+    """
+    if isinstance(x, str):
+        k = x.strip() or default_kind
+        return {"kind": k, "params": {}}
+    if isinstance(x, dict):
+        k = (x.get("kind") or x.get("model") or default_kind)
+        params = x.get("params") if isinstance(x.get("params"), dict) else {k2: v2 for k2, v2 in x.items() if k2 not in ("kind", "model")}
+        return {"kind": str(k), "params": dict(params) if isinstance(params, dict) else {}}
+    return {"kind": default_kind, "params": {}}
+
+
+def _default_models() -> Dict[str, Any]:
+    return {
+        "entry": {"kind": "immediate", "params": {}},
+        "position_mgmt": {"kind": "none", "params": {}},
+        "profit": {"kind": "tslfe", "params": {}},
+        "stop": {"kind": "5pt_hard", "params": {"cents": 5}},
+        "exit": {"kind": "tslfe", "params": {}},
+    }
+
+
+def _synthesize_models(intent: Dict[str, Any]) -> Dict[str, Any]:
+    """Prefer intent.models; else build from legacy fields + defaults."""
+    d = _default_models()
+    models = intent.get("models")
+    if isinstance(models, dict):
+        out: Dict[str, Any] = {}
+        for k in ("entry", "position_mgmt", "profit", "stop", "exit"):
+            out[k] = _coerce_model(models.get(k), default_kind=d[k]["kind"])
+            # merge defaults for stop cents if missing
+            if k == "stop" and not out[k].get("params"):
+                out[k]["params"] = dict(d[k]["params"])
+        return out
+
+    # Legacy fields
+    out = {
+        "entry": _coerce_model(intent.get("entry_model"), default_kind=d["entry"]["kind"]),
+        "position_mgmt": _coerce_model(intent.get("position_management_model"), default_kind=d["position_mgmt"]["kind"]),
+        "profit": _coerce_model(intent.get("profit_model"), default_kind=d["profit"]["kind"]),
+        "stop": _coerce_model(intent.get("stop_model") or intent.get("stop_loss_model"), default_kind=d["stop"]["kind"]),
+        "exit": _coerce_model(intent.get("exit_model"), default_kind=d["exit"]["kind"]),
+    }
+    # Apply defaults for missing stop params
+    if not isinstance(out["stop"].get("params"), dict) or not out["stop"]["params"]:
+        out["stop"]["params"] = dict(d["stop"]["params"])
+    return out
+
+
+def _parse_iso_ts_to_epoch(ts: str) -> Optional[float]:
+    try:
+        s = (ts or "").strip()
+        if not s:
+            return None
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_tz.utc)
+        return dt.timestamp()
+    except Exception:
+        return None
+
+
+def _normalize_trigger(intent: Dict[str, Any]) -> Dict[str, Any]:
+    """Unified trigger object for LIVE + REPLAY.
+
+    Defaults to kind=now.
+    """
+    trig = intent.get("trigger")
+    if not isinstance(trig, dict):
+        return {"kind": "now", "session": "ANY", "params": {}}
+
+    kind = str(trig.get("kind") or "now").strip().lower()
+    session = str(trig.get("session") or "ANY").strip().upper() or "ANY"
+    params = trig.get("params") if isinstance(trig.get("params"), dict) else {}
+
+    if kind == "at_time":
+        ts_iso = trig.get("ts")
+        ts_epoch = _parse_iso_ts_to_epoch(str(ts_iso or "")) if ts_iso is not None else None
+        p = dict(params)
+        tol_ms = int(p.get("tolerance_ms") or 500)
+        late_action = str(p.get("late_action") or "execute").strip().lower()
+        if late_action not in ("execute", "skip", "expire"):
+            late_action = "execute"
+        p["tolerance_ms"] = tol_ms
+        p["late_action"] = late_action
+        return {"kind": "at_time", "ts": ts_iso, "ts_epoch": ts_epoch, "session": session, "params": p}
+
+    return {"kind": "now", "session": session, "params": dict(params)}
+
 @app.post("/v1/intents")
 async def api_intents_ingest(request: Request):
     """Standard execution front-door: turn an intent into a managed trade.
@@ -231,6 +333,29 @@ async def api_intents_ingest(request: Request):
     if sess not in ("PRE", "RTH", "POST"):
         sess = "RTH"
 
+    # --- Canonical v3 fields (best-effort; keep legacy compatible) ---------
+    schema = str(intent.get("schema") or "").strip() or None
+    mode = str(intent.get("mode") or os.getenv("REFLEX_MODE") or "LIVE").strip().upper()
+    if mode not in ("LIVE", "REPLAY"):
+        mode = "LIVE"
+
+    gen_id = str(intent.get("gen_id") or "").strip()
+    if len(gen_id) != 1:
+        # Keep non-blocking: derive a 1-char provenance from known fields
+        src = str(intent.get("source") or intent.get("strategy_id") or "?").strip()
+        gen_id = (src[:1] or "?")
+
+    models = _synthesize_models(intent)
+    trigger = _normalize_trigger(intent)
+
+    # "always protected" invariant: ensure a stop model exists
+    try:
+        sk = str(models.get("stop", {}).get("kind") or "").strip()
+        if not sk:
+            models["stop"] = {"kind": "5pt_hard", "params": {"cents": 5}}
+    except Exception:
+        models["stop"] = {"kind": "5pt_hard", "params": {"cents": 5}}
+
     trade = {
         "trade_id": trade_id,
         "account_id": account_id,
@@ -244,6 +369,20 @@ async def api_intents_ingest(request: Request):
         "intent_strength": intent.get("strength"),
         "intent": intent,
         "meta": meta,
+
+        # Canonical intent v3 fields
+        "intent_schema": schema,
+        "intent_mode": mode,
+        "gen_id": gen_id,
+        "trigger": trigger,
+        "models": models,
+
+        # Keep legacy model fields populated for older paths/loggers
+        "entry_model": (models.get("entry") or {}).get("kind"),
+        "position_mgmt_model": (models.get("position_mgmt") or {}).get("kind"),
+        "profit_model": (models.get("profit") or {}).get("kind"),
+        "stop_loss_model": (models.get("stop") or {}).get("kind"),
+        "exit_model": (models.get("exit") or {}).get("kind"),
     }
 
     _MANAGED_TRADES[trade_id] = trade
@@ -519,7 +658,7 @@ class _StoreShim:
             import json as _json
             import redis  # type: ignore
 
-            instance_id = (os.getenv("REFLEX_INSTANCE_ID") or os.getenv("INSTANCE") or "liveA").strip()
+            instance_id = (os.getenv("REFLEX_INSTANCE_ID") or os.getenv("INSTANCE") or "live").strip()
             tpl = (os.getenv("TRADER_MD_KEY_PREFIX", "reflex:{instance_id}:md") or "reflex:{instance_id}:md").strip()
             prefix = tpl.format(instance_id=instance_id).rstrip(":")
             key = f"{prefix}:{sym}"
@@ -771,7 +910,7 @@ async def debug_md(symbol: str = Query(...)):
         raise HTTPException(status_code=400, detail="symbol required")
 
     # The exact same prefix logic used in your get_md() fallback
-    instance_id = (os.getenv("REFLEX_INSTANCE_ID") or os.getenv("INSTANCE") or "liveA").strip()
+    instance_id = (os.getenv("REFLEX_INSTANCE_ID") or os.getenv("INSTANCE") or "live").strip()
     tpl = (os.getenv("TRADER_MD_KEY_PREFIX", "reflex:{instance_id}:md") or "reflex:{instance_id}:md").strip()
     prefix = tpl.format(instance_id=instance_id).rstrip(":")
     key = f"{prefix}:{sym}"
@@ -880,6 +1019,7 @@ async def debug_exit_eval(
             {
                 "trade_id": t.get("trade_id"),
                 "account_id": t.get("account_id"),
+                "gen_id": t.get("gen_id"),
                 "symbol": sym,
                 "state": st,
                 "kind": kind,
@@ -1073,6 +1213,9 @@ async def portfolio_positions(account_id: str = Query(...)):
                 d["trade_id"] = t.get("trade_id")
                 d["trade_state"] = t.get("state")
 
+                # PTI provenance tag (single letter)
+                d["gen_id"] = t.get("gen_id")
+
                 # Prefer explicit compat fields, fall back to soft fields
                 stop_px = t.get("stop_price") or t.get("soft_stop_price")
                 tp_px = t.get("take_profit_price") or t.get("soft_target_price")
@@ -1098,6 +1241,89 @@ async def portfolio_positions(account_id: str = Query(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
+@app.get("/v1/portfolio/closed_positions")
+async def portfolio_closed_positions(
+    account_id: Optional[str] = Query(None),
+    scope: str = Query("today"),  # today|all
+    limit: int = Query(500, ge=1, le=5000),
+):
+    """Closed positions as computed/persisted by Trader.
+
+    This is the canonical, truth-first view for BrokerView. UI must not infer.
+    """
+    try:
+        scope_l = (scope or "today").lower().strip()
+        tz = None
+        try:
+            if ZoneInfo is not None:
+                tz = ZoneInfo("America/New_York")
+        except Exception:
+            tz = None
+
+        today_et = None
+        if scope_l == "today" and tz is not None:
+            today_et = datetime.now(tz=tz).date()
+
+        items: List[Dict[str, Any]] = []
+        for t in list(_MANAGED_TRADES.values()):
+            if not isinstance(t, dict):
+                continue
+            if account_id and str(t.get("account_id") or "") != str(account_id):
+                continue
+            if str(t.get("state") or "").upper() != "DONE":
+                continue
+
+            exit_ts = t.get("exit_filled_ts") or t.get("exit_ts") or t.get("closed_ts") or t.get("updated_iso") or None
+            # Today filter (ET)
+            if today_et is not None and exit_ts:
+                try:
+                    d = datetime.fromisoformat(str(exit_ts).replace("Z", "+00:00"))
+                    if tz is not None:
+                        d = d.astimezone(tz)
+                    if d.date() != today_et:
+                        continue
+                except Exception:
+                    pass
+
+            qty = t.get("qty")
+            entry_px = t.get("entry_avg_price")
+            exit_px = t.get("exit_fill_price") or t.get("exit_price")
+
+            doc = {
+                "trade_id": t.get("trade_id"),
+                "account_id": t.get("account_id"),
+                "gen_id": t.get("gen_id"),
+                "symbol": t.get("symbol"),
+                "side": t.get("side") or "LONG",
+                "qty": qty,
+                "entry_price": entry_px,
+                "exit_price": exit_px,
+                "exit_ts": exit_ts,
+                "pnl": t.get("realized_pl"),
+                "close_reason": t.get("close_reason") or t.get("exit_reason") or "CLOSED",
+            }
+
+            # Backfill realized_pl if missing but we have prices
+            try:
+                if doc["pnl"] is None and entry_px is not None and exit_px is not None and qty is not None:
+                    q = float(qty)
+                    ep = float(entry_px)
+                    xp = float(exit_px)
+                    if q and ep and xp:
+                        doc["pnl"] = (xp - ep) * q
+            except Exception:
+                pass
+
+            items.append(doc)
+
+        def _k(x: Dict[str, Any]) -> str:
+            return str(x.get("exit_ts") or "")
+
+        items.sort(key=_k, reverse=True)
+        return {"items": items[: int(limit)], "scope": scope_l, "account_id": account_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/v1/orders")
 async def get_orders(

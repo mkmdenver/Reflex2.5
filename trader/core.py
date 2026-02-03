@@ -33,7 +33,7 @@ def get_env(name: str, default: Optional[str] = None) -> Optional[str]:
     return os.environ.get(name, default)
 
 def get_instance_id() -> str:
-    return get_env("REFLEX_INSTANCE_ID", "liveA")
+    return get_env("REFLEX_INSTANCE_ID", "live")
 
 def get_redis_url() -> str:
     url = get_env("GARNET_URL")

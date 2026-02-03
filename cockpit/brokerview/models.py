@@ -72,6 +72,8 @@ class PositionDoc(BaseModel):
     target_price: Optional[float] = None
     take_profit_price: Optional[float] = None
 
+    # Single-letter provenance tag from PTI (e.g., R, B, 1, etc.)
+    gen_id: Optional[str] = None
 
     # some feeds may send this as null / missing when flat
     side: Optional[PositionSide] = None

@@ -32,36 +32,7 @@ if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
 
-def _with_instance_suffix(channel: str, instance_id: str, feed_mode: str) -> str:
-    ch = (channel or "").strip()
-    if not ch:
-        return ch
 
-    # allow explicit templating
-    if "{instance_id}" in ch:
-        return ch.replace("{instance_id}", instance_id)
-
-    # Only suffix in LIVE
-    if (feed_mode or "").upper() != "LIVE":
-        return ch
-
-    inst = (instance_id or "").strip()
-    if not inst:
-        return ch
-
-    # already suffixed
-    if ch.endswith(f".{inst}"):
-        return ch
-
-    # canonical live instance channels
-    if ch in ("eval.intent", "manual.intent"):
-        return f"{ch}.{inst}"
-
-    # if caller already supplied some suffix, leave it alone
-    if ch.startswith("eval.intent.") or ch.startswith("manual.intent."):
-        return ch
-
-    return ch
 
 
 from common import logging as log  # noqa: E402
@@ -306,7 +277,6 @@ def _apply_record_path_stamping(path: str, run_id: str) -> str:
 
 @dataclass
 class Config:
-    instance_id: str
     run_id: str
     feed_mode: str  # LIVE / REPLAY
     redis_url: str
@@ -333,6 +303,8 @@ class Config:
     strategy_id: str
     urgency: str
 
+    gen_id: str  # one-char intent generator id
+
     # Risk hint knobs
     stop_buffer: float
     max_emits_per_symbol_per_minute: int
@@ -356,9 +328,8 @@ class Config:
 
 
 def load_config() -> Config:
-    instance_id = _env("REFLEX_INSTANCE_ID", "liveA")
 
-    run_id = _env("REFLEX_RUN_ID")
+    run_id = _env("PTI_RUN_ID")
     if not run_id:
         run_id = f"run_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
 
@@ -368,34 +339,21 @@ def load_config() -> Config:
 
     redis_url = _env("GARNET_URL") or _env("REDIS_URL", "redis://127.0.0.1:6379/0")
 
+
     symbols = _csv_syms(_env("PTI_SYMBOLS", ""))
     if symbols:
         symbols_mode = "static"
     else:
-        symbols_mode = _env("PTI_SYMBOLS_MODE", "active_set").lower()
+        symbols_mode = _env("" \
+        "", "active_set").lower()
         if symbols_mode != "active_set":
             symbols_mode = "active_set"
 
     active_set_key = _env("PTI_ACTIVE_SET_KEY", "eval:fts_rbf:active")
     filter_stream_channel = _env("PTI_FILTER_STREAM_CHANNEL", "eval.rbf_filter_stream")
-
-    bars_channel = _env("PTI_BARS_CHANNEL")
-    if not bars_channel:
-        bars_channel = _env(
-            "REFLEX_DATAHUB_BARS1M_PUB_REPLAY" if feed_mode == "REPLAY" else "REFLEX_DATAHUB_BARS1M_PUB_LIVE",
-            "hub.bars1m.pub.replay" if feed_mode == "REPLAY" else "hub.bars1m.pub.live",
-        )
-
-    min_leg_pct = float(_env("RBF_MIN_LEG_PCT", _env("ROSS_MIN_LEG_PCT", "0.01")))
-    max_flag_retrace = float(_env("RBF_MAX_FLAG_RETRACE", _env("ROSS_MAX_FLAG_RETRACE", "0.7")))
-    breakout_pct = float(_env("RBF_BREAKOUT_PCT", _env("ROSS_BREAKOUT_PCT", "0.00")))
-
-    intent_channel = _env("PTI_INTENT_CHANNEL", CHANNELS.get("order", "eval.order_intent"))
-    intent_channel = _with_instance_suffix(intent_channel, instance_id, feed_mode)
-
-    intent_mode = _env("PTI_INTENT_MODE", "send").lower()
-    if intent_mode not in ("send", "record", "tee", "off"):
-        intent_mode = "send"
+    bars_channel = _env("PTI_BARS_CHANNEL","hub.bars1m.pub.live")
+    intent_channel = _env("PTI_INTENT_CHANNEL", "eval.intent.live")
+    intent_mode = _env("PTI_INTENT_MODE", "send")
 
     default_record = str(_repo_root / "evaluator" / "runs" / "pti_rbf" / "intents.jsonl")
     intent_record_path = _env("PTI_INTENT_RECORD_PATH", default_record)
@@ -405,23 +363,19 @@ def load_config() -> Config:
     account_id = _env("PTI_ACCOUNT_ID") or None
     source = _env("PTI_SOURCE", "bot")
     strategy_id = _env("PTI_STRATEGY_ID", "pti_rbf")
+
+    gen_id = _env("PTI_GEN_ID", "B").strip().upper()[:1] or "B"
     urgency = _env("PTI_URGENCY", "normal").lower()
 
     stop_buffer = float(_env("PTI_RBF_STOP_BUFFER", "0.01"))
-    max_emits_per_symbol_per_minute = int(_env("PTI_RBF_MAX_EMITS_PER_SYMBOL_PER_MINUTE", "1"))
 
     request_tier = _env("PTI_REQUEST_TIER", "1").lower() in ("1", "true", "yes", "on")
     request_tier_name = _env("PTI_REQUEST_TIER_NAME", "WATCH").upper()
     if request_tier_name not in ("COLD", "WATCH", "WARM", "HOT"):
         request_tier_name = "WATCH"
 
-    active_set_resync_secs = int(_env("PTI_ACTIVE_SET_RESYNC_SECS", "5"))
-    if active_set_resync_secs < 0:
-        active_set_resync_secs = 0
+    stats_log_every = int(_env("PTI_STATS_LOG_EVERY", "200"))
 
-    stats_log_every = int(_env("RBF_STATS_LOG_EVERY", "200"))
-
-    # --- NEW: debug and disk event log knobs ---
     debug = _truthy(_env("PTI_DEBUG", "0"))
     debug_bars = _truthy(_env("PTI_DEBUG_BARS", "0")) or debug
     debug_decisions = _truthy(_env("PTI_DEBUG_DECISIONS", "0")) or debug
@@ -430,11 +384,19 @@ def load_config() -> Config:
     event_log_enable = _truthy(_env("PTI_EVENT_LOG_ENABLE", "0"))
     event_log_path = _resolve_path_under_root(_env("PTI_EVENT_LOG_PATH", "logs/pti_rbf_events.jsonl"))
 
+    active_set_resync_secs = int(_env("PTI_ACTIVE_SET_RESYNC_SECS", "5"))
+    if active_set_resync_secs < 0:
+        active_set_resync_secs = 0
+
+    min_leg_pct = float(_env("PTI_MIN_LEG_PCT", "0.05"))
+    max_flag_retrace = float(_env("PTI_MAX_FLAG_RETRACE", "0.5"))
+    breakout_pct = float(_env("PTI_BREAKOUT_PCT", "0.01"))
+    max_emits_per_symbol_per_minute = int(_env("PTI_MAX_EMITS_PER_SYMBOL_PER_MINUTE", "3"))
+
     log.info(
         COMPONENT,
         "startup.config",
         extra={
-            "instance_id": instance_id,
             "run_id": run_id,
             "feed_mode": feed_mode,
             "redis_url": redis_url,
@@ -447,21 +409,25 @@ def load_config() -> Config:
             "intent_channel": intent_channel,
             "intent_record_path": intent_record_path,
             "strategy_id": strategy_id,
+            "gen_id": gen_id,
             "account_id": account_id,
             "request_tier": request_tier,
             "request_tier_name": request_tier_name,
-            "active_set_resync_secs": active_set_resync_secs,
             "debug": debug,
             "debug_bars": debug_bars,
             "debug_decisions": debug_decisions,
             "debug_throttle_sec": debug_throttle_sec,
             "event_log_enable": event_log_enable,
             "event_log_path": event_log_path if event_log_enable else None,
+            "active_set_resync_secs": active_set_resync_secs,
+            "min_leg_pct": min_leg_pct,
+            "max_flag_retrace": max_flag_retrace,
+            "breakout_pct": breakout_pct,
+            "max_emits_per_symbol_per_minute": max_emits_per_symbol_per_minute,
         },
     )
 
     return Config(
-        instance_id=instance_id,
         run_id=run_id,
         feed_mode=feed_mode,
         redis_url=redis_url,
@@ -480,11 +446,11 @@ def load_config() -> Config:
         source=source,
         strategy_id=strategy_id,
         urgency=urgency,
+        gen_id=gen_id,
         stop_buffer=stop_buffer,
         max_emits_per_symbol_per_minute=max_emits_per_symbol_per_minute,
         request_tier=request_tier,
         request_tier_name=request_tier_name,
-        active_set_resync_secs=active_set_resync_secs,
         stats_log_every=stats_log_every,
         debug=debug,
         debug_bars=debug_bars,
@@ -492,7 +458,9 @@ def load_config() -> Config:
         debug_throttle_sec=debug_throttle_sec,
         event_log_enable=event_log_enable,
         event_log_path=event_log_path,
+        active_set_resync_secs=active_set_resync_secs,
     )
+
 
 
 def make_sink(cfg: Config) -> IntentSink:
@@ -515,12 +483,11 @@ def _evtlog(cfg: Config, evt: Dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def request_tier(symbol: str, tier: str, instance_id: str) -> None:
+async def request_tier(symbol: str, tier: str) -> None:
     evt = {
         "symbol": symbol.upper(),
         "tier": tier.upper(),
         "source": COMPONENT,
-        "instance_id": instance_id,
         "ts_ms": int(time.time() * 1000),
     }
     await publish_async(CHANNELS["raise"], evt)
@@ -573,7 +540,7 @@ async def _filter_stream_loop(cfg: Config, active: Set[str]) -> None:
                 log.info(COMPONENT, "filter.add", extra={"symbol": sym, "active_count": len(active)})
                 _evtlog(cfg, {"kind": "universe.add", "ts": time.time(), "symbol": sym, "active_count": len(active), "source": "filter_stream"})
                 if cfg.feed_mode == "LIVE" and cfg.request_tier:
-                    await request_tier(sym, cfg.request_tier_name, cfg.instance_id)
+                    await request_tier(sym, cfg.request_tier_name)
         elif kind == "remove":
             if sym in active:
                 active.discard(sym)
@@ -612,7 +579,7 @@ async def _active_set_resync_loop(cfg: Config, active: Set[str]) -> None:
                 _evtlog(cfg, {"kind": "universe.resync.add", "ts": time.time(), "count": len(added), "symbols": list(sorted(added))[:50], "active_count": len(active)})
                 if cfg.feed_mode == "LIVE" and cfg.request_tier:
                     for sym in sorted(added):
-                        await request_tier(sym, cfg.request_tier_name, cfg.instance_id)
+                        await request_tier(sym, cfg.request_tier_name)
 
             if removed:
                 for sym in removed:
@@ -738,7 +705,7 @@ class RossPatternState:
 
 
 # ---------------------------------------------------------------------------
-# Intent emission (shape matches PTI_1barup)
+# Intent emission 
 # ---------------------------------------------------------------------------
 
 
@@ -797,13 +764,38 @@ async def emit_intent_rbf_breakout(
         "level": float(leg_high) * (1.0 + float(cfg.breakout_pct)),
     }
     if event_ts is not None:
-        signal_trigger["bar_ts"] = event_ts
+        signal_trigger["bar_ts"] = event_ts    # Trigger (required): LIVE => now, REPLAY => schedule at bar/event timestamp
+    # Note: we keep the original breakout trigger in diag["signal_trigger"] for analysis.
+    if cfg.feed_mode == "REPLAY":
+        trigger: Dict[str, Any] = {
+            "kind": "at_time",
+            "ts": event_ts or intent_ts,
+            "session": "ANY",
+            "params": {
+                "tolerance_ms": 500,
+                "late_action": "execute",
+            },
+        }
+    else:
+        trigger = {
+            "kind": "now",
+            "session": "ANY",
+            "params": {},
+        }
 
-    # ENTRY MODEL v1: immediate entry (no waiting on trigger level).
-    # We still preserve the original breakout trigger in diag["signal_trigger"] for analysis.
-    trigger: Dict[str, Any] = {"kind": "immediate"}
+    # Canonical intent models (LIVE + REPLAY share the same shape)
+    models: Dict[str, Any] = {
+        "entry": {"kind": "immediate", "params": {}},
+        "position_mgmt": {"kind": "none", "params": {}},
+        "profit": {"kind": "tslfe", "params": {}},
+        "stop": {"kind": "5pt_hard", "params": {"cents": 5}},
+        "exit": {"kind": "tslfe", "params": {}},
+    }
 
     intent: Dict[str, Any] = {
+        "schema": "reflex.intent.v3",
+        "mode": cfg.feed_mode,
+        "gen_id": cfg.gen_id,
         "intent_id": intent_id,
         "ts": intent_ts,
         "symbol": sym,
@@ -816,13 +808,17 @@ async def emit_intent_rbf_breakout(
         "urgency": cfg.urgency,
         # --- Trade model selection (v1) ---------------------------------
         "entry_model": {"kind": "immediate"},
+        "entry_model_name": "immediate",
         "position_management_model": {"kind": "none"},
+        "position_mgmt_model": "none",
         "profit_model": {"kind": "tslfe"},
+        "stop_model": {"kind": "5pt_hard", "cents": 5},
         "stop_loss_model": {"kind": "5pt_hard", "cents": 5},
         # Back-compat for Trader API (app.py): selects TradeRunner exit behavior
         "exit_model": "tslfe",
 
         "trigger": trigger,
+        "models": models,
         "reason": "rbf: Ross Bull Flag breakout (leg->flag->break above leg_high)",
         "tags": ["rbf", "ross_bullflag", "1m", "breakout"],
         "risk_hints": {
@@ -852,7 +848,7 @@ async def emit_intent_rbf_breakout(
         "event_ts": event_ts,
         "emitted_ts": emitted_ts,
         "run_id": cfg.run_id,
-        "instance_id": cfg.instance_id,
+
         "source_component": COMPONENT,
         "intent": intent,
     }
@@ -1130,7 +1126,7 @@ async def run() -> None:
         _evtlog(cfg, {"kind": "universe.static", "ts": time.time(), "count": len(active), "symbols": list(cfg.symbols)[:200]})
         if cfg.feed_mode == "LIVE" and cfg.request_tier:
             for sym in sorted(active):
-                await request_tier(sym, cfg.request_tier_name, cfg.instance_id)
+                await request_tier(sym, cfg.request_tier_name)
     else:
         active = await _bootstrap_active_set(cfg)
         log.info(COMPONENT, "universe.active_set", extra={"count": len(active)})

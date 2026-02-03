@@ -20,7 +20,7 @@ except Exception:  # very defensive; we can still run without HTTP tier promote
 
 # --- Config via .env ---------------------------------------------------------
 
-INSTANCE = os.getenv("INSTANCE", "liveA")
+INSTANCE = os.getenv("INSTANCE", "live")
 
 DATAHUB_API_BASE = os.getenv("DATAHUB_API_BASE", "http://127.0.0.1:7000")
 

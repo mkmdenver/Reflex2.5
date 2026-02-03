@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
@@ -52,6 +52,17 @@ TRADER_BASE = _env("TRADER_BASE", f"http://127.0.0.1:{TRADER_API_PORT}")
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 log.info("BrokerView config port=%s trader_base=%s root=%s", BROKERVIEW_PORT, TRADER_BASE, ROOT)
+
+# ---------------------------------------------------------------------------
+# UI stability caches (in-memory, per BrokerView process).
+# Goal: avoid scary 5xx flashes in the UI during refresh bursts or transient
+# Trader hiccups. We serve last-known-good snapshots when Trader is unavailable.
+# This is intentionally simple and low-risk (no persistence, no refactor).
+# ---------------------------------------------------------------------------
+_CACHE_POSITIONS: dict[str, PositionsResponse] = {}
+_CACHE_ORDERS: dict[str, OrdersResponse] = {}           # key = "{account}:{status}"
+_CACHE_CLOSED_POS: dict[str, dict[str, Any]] = {}       # key = "{account}:{scope}"
+
 
 
 class OrderIn(BaseModel):
@@ -263,8 +274,12 @@ async def positions(account: Optional[str] = None) -> PositionsResponse:
             resp = await client.get(f"{TRADER_BASE}/v1/portfolio/positions", params=params)
             resp.raise_for_status()
         except httpx.HTTPError as e:
-            log.exception("Error fetching positions from Trader: %s", e)
-            raise HTTPException(status_code=502, detail="Trader unavailable")
+            log.warning("Trader unavailable for positions; serving cached snapshot (%s)", e)
+            cache_key = str(account or "")
+            cached = _CACHE_POSITIONS.get(cache_key)
+            if cached is not None:
+                return cached
+            return PositionsResponse(positions=[])
 
         raw = resp.json()
 
@@ -297,13 +312,46 @@ async def positions(account: Optional[str] = None) -> PositionsResponse:
                     stop_price=p.get("stop_price"),
                     target_price=p.get("target_price"),
                     take_profit_price=p.get("take_profit_price"),
+                    gen_id=p.get("gen_id"),
                     raw=p,
                 )
             )
 
-        return PositionsResponse(positions=docs)
+        resp_doc = PositionsResponse(positions=docs)
+        _CACHE_POSITIONS[str(account or "")] = resp_doc
+        return resp_doc
 
 
+
+@app.get("/v1/closed_positions")
+async def api_closed_positions(scope: str = "today", account: str | None = None, limit: int = 1000):
+    """Proxy Trader's canonical closed positions endpoint for the UI.
+
+    UI stability rule: never throw 5xx due to transient Trader hiccups.
+    If Trader is unavailable, serve last-known-good closed positions for the
+    requested (account, scope). If none exist yet, return an empty list.
+    """
+    acct = str(account or "")
+    sc = str(scope or "today")
+    cache_key = f"{acct}:{sc}"
+    params: dict[str, object] = {"scope": sc, "limit": int(limit)}
+    if account:
+        params["account_id"] = acct
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"{TRADER_BASE}/v1/portfolio/closed_positions", params=params)
+        resp.raise_for_status()
+        data = resp.json() if resp.content else {}
+        items = (data.get("items") if isinstance(data, dict) else None) or []
+        out = {"closed_positions": items}
+        _CACHE_CLOSED_POS[cache_key] = out
+        return out
+    except Exception as e:
+        log.warning("Trader unavailable for closed_positions; serving cached snapshot (%s)", e)
+        cached = _CACHE_CLOSED_POS.get(cache_key)
+        if cached is not None:
+            return cached
+        return {"closed_positions": []}
 
 @app.get("/v1/orders", response_model=OrdersResponse)
 async def orders(status: str = "all", account: Optional[str] = None) -> OrdersResponse:
@@ -341,8 +389,22 @@ async def orders(status: str = "all", account: Optional[str] = None) -> OrdersRe
                 j = resp.json()
                 raw_orders = j.get("orders") or j.get("items") or []
         except httpx.HTTPError as e:
-            log.exception("Error fetching orders from Trader: %s", e)
-            raise HTTPException(status_code=502, detail="Trader unavailable")
+            log.warning("Trader unavailable for orders; serving cached snapshot (%s)", e)
+            acct = str(account or "")
+            if want_all:
+                a = _CACHE_ORDERS.get(f"{acct}:active")
+                c = _CACHE_ORDERS.get(f"{acct}:closed")
+                merged: List[OrderDoc] = []
+                if a is not None:
+                    merged.extend(a.orders)
+                if c is not None:
+                    merged.extend(c.orders)
+                return OrdersResponse(orders=merged)
+            key = f"{acct}:{str(status or '').lower()}"
+            cached = _CACHE_ORDERS.get(key)
+            if cached is not None:
+                return cached
+            return OrdersResponse(orders=[])
 
     docs: List[OrderDoc] = []
     for o in raw_orders:
@@ -366,7 +428,12 @@ async def orders(status: str = "all", account: Optional[str] = None) -> OrdersRe
             )
         )
 
-    return OrdersResponse(orders=docs)
+    resp_doc = OrdersResponse(orders=docs)
+    acct = str(account or "")
+    st = str(status or "").lower()
+    if st in ("active", "closed"):
+        _CACHE_ORDERS[f"{acct}:{st}"] = resp_doc
+    return resp_doc
 
 
 @app.post("/v1/orders")

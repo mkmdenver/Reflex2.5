@@ -26,7 +26,7 @@ if sys.platform.startswith("win"):
 # ---- config from env ---------------------------------------------------------
 _env = load_env()
 
-INSTANCE_ID = os.getenv("REFLEX__INSTANCE_ID", "liveA")
+INSTANCE_ID = os.getenv("REFLEX__INSTANCE_ID", "live")
 PG_DSN = (
     os.getenv("REFLEX__STORAGE__PG_DSN")
     or os.getenv("REFLEX__PG_DSN")

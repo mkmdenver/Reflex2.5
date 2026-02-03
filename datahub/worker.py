@@ -135,11 +135,11 @@ def compute_subscriptions(rows: Iterable[Tuple[str, str]]) -> Subscriptions:
 # ---------------------------------------------------------------------------
 
 def _make_live_adapter():
-    from datahub.adapters.live_adapter import LIVEAdapter  # type: ignore
+    from datahub.adapters.live_adapter import livedapter  # type: ignore
 
     api_key = os.getenv("POLYGON_API_KEY") or os.getenv("POLYGON_KEY") or ""
     ws_url = os.getenv("POLYGON_WS_URL") or None
-    return LIVEAdapter(api_key=api_key, ws_url=ws_url)
+    return livedapter(api_key=api_key, ws_url=ws_url)
 
 
 def _make_adapter(mode: str, _router: Router):

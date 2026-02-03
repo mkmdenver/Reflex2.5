@@ -13,7 +13,7 @@ Event = Dict[str, Any]
 
 
 @dataclass
-class LIVEAdapter:
+class livedapter:
     api_key: str
     ws_url: Optional[str] = None
 
@@ -38,7 +38,7 @@ class LIVEAdapter:
 
     def open(self) -> None:
         if self._stream is not None:
-            logger.warning("LIVEAdapter.open(): stream already open; ignoring")
+            logger.warning("livedapter.open(): stream already open; ignoring")
             return
 
         cfg = WSConfig(api_key=self.api_key)
@@ -47,7 +47,7 @@ class LIVEAdapter:
         self._cfg = cfg
 
         logger.info(
-            "LIVEAdapter.open(): url=%s api_key_hint=%s",
+            "livedapter.open(): url=%s api_key_hint=%s",
             getattr(cfg, "url", None),
             (self.api_key[:4] + "…") if self.api_key else "NONE",
         )
@@ -64,11 +64,11 @@ class LIVEAdapter:
     def close(self) -> None:
         if self._stream is None:
             return
-        logger.info("LIVEAdapter.close()")
+        logger.info("livedapter.close()")
         try:
             self._stream.stop()
         except Exception as exc:
-            logger.warning("LIVEAdapter.close(): stop() error: %s", exc)
+            logger.warning("livedapter.close(): stop() error: %s", exc)
         finally:
             self._stream = None
             self._current_trades.clear()
@@ -83,7 +83,7 @@ class LIVEAdapter:
 
     def subscribe(self, trades: Iterable[str] = (), quotes: Iterable[str] = (), bars_1m: Iterable[str] = ()) -> None:
         if self._stream is None:
-            logger.warning("LIVEAdapter.subscribe(): stream is not open yet")
+            logger.warning("livedapter.subscribe(): stream is not open yet")
             return
 
         new_trades = {s.strip().upper() for s in trades if s and str(s).strip()}
@@ -98,7 +98,7 @@ class LIVEAdapter:
             return
 
         logger.info(
-            "LIVEAdapter.subscribe(): add_trades=%s add_quotes=%s add_bars_1m=%s",
+            "livedapter.subscribe(): add_trades=%s add_quotes=%s add_bars_1m=%s",
             t_to_add, q_to_add, b_to_add,
         )
 
@@ -109,7 +109,7 @@ class LIVEAdapter:
                 self._stream.subscribe_bars_1m(b_to_add)
         except Exception as exc:
             self._last_error = f"subscribe error: {exc}"
-            logger.exception("LIVEAdapter.subscribe(): error: %s", exc)
+            logger.exception("livedapter.subscribe(): error: %s", exc)
             return
 
         self._current_trades.update(t_to_add)
@@ -118,7 +118,7 @@ class LIVEAdapter:
 
     def unsubscribe(self, trades: Iterable[str] = (), quotes: Iterable[str] = (), bars_1m: Iterable[str] = ()) -> None:
         if self._stream is None:
-            logger.warning("LIVEAdapter.unsubscribe(): stream is not open yet")
+            logger.warning("livedapter.unsubscribe(): stream is not open yet")
             return
 
         rem_trades = {s.strip().upper() for s in trades if s and str(s).strip()}
@@ -133,7 +133,7 @@ class LIVEAdapter:
             return
 
         logger.info(
-            "LIVEAdapter.unsubscribe(): remove_trades=%s remove_quotes=%s remove_bars_1m=%s",
+            "livedapter.unsubscribe(): remove_trades=%s remove_quotes=%s remove_bars_1m=%s",
             t_to_remove, q_to_remove, b_to_remove,
         )
 
@@ -144,7 +144,7 @@ class LIVEAdapter:
                 self._stream.unsubscribe_bars_1m(b_to_remove)
         except Exception as exc:
             self._last_error = f"unsubscribe error: {exc}"
-            logger.exception("LIVEAdapter.unsubscribe(): error: %s", exc)
+            logger.exception("livedapter.unsubscribe(): error: %s", exc)
             return
 
         self._current_trades.difference_update(t_to_remove)
@@ -171,7 +171,7 @@ class LIVEAdapter:
             return
 
         logger.info(
-            "LIVEAdapter.update_subscriptions(): "
+            "livedapter.update_subscriptions(): "
             "add T=%s Q=%s AM=%s | remove T=%s Q=%s AM=%s",
             t_to_add, q_to_add, b_to_add, t_to_remove, q_to_remove, b_to_remove
         )
@@ -186,7 +186,7 @@ class LIVEAdapter:
     # ----------------------------
 
     def stream(self) -> Iterator[Event]:
-        logger.info("LIVEAdapter.stream(): starting event loop")
+        logger.info("livedapter.stream(): starting event loop")
         while True:
             yield self._pending.get()
 
@@ -194,12 +194,12 @@ class LIVEAdapter:
         try:
             self._pending.put_nowait(ev)
         except queue.Full:
-            logger.warning("LIVEAdapter._on_event(): queue full; dropping event")
+            logger.warning("livedapter._on_event(): queue full; dropping event")
 
     def _on_status(self, status: str) -> None:
         self._status = status
-        logger.info("LIVEAdapter._on_status(): %s", status)
+        logger.info("livedapter._on_status(): %s", status)
 
     def _on_error(self, err: Any) -> None:
         self._last_error = str(err)
-        logger.exception("LIVEAdapter._on_error(): %s", err)
+        logger.exception("livedapter._on_error(): %s", err)

@@ -502,7 +502,7 @@ export default function App() {
           </div>
           <div>
             <span style={smallText}>
-              Instance: <strong>liveA</strong> • <MarketClock />
+              Instance: <strong>live</strong> • <MarketClock />
             </span>
           </div>
         </header>

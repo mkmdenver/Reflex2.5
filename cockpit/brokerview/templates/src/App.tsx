@@ -207,6 +207,10 @@ interface Position {
   side?: string | null;
   account_id?: string | null;
 
+  // Optional
+  // Single-letter provenance tag from PTI (Trader-managed)
+  gen_id?: string | null;
+
   // Optional (not always provided by Trader). BrokerView will also maintain a local
   // first-seen timestamp so we can produce a stable "entered" sort under load.
   opened_at?: string | null;
@@ -282,7 +286,9 @@ interface AccountsResponse {
 type ExitTag = "stop" | "target";
 
 type ClosedPositionRow = {
+  trade_id?: string | null;
   account_id?: string | null;
+  gen_id?: string | null;
   symbol: string;
   side: "LONG" | "SHORT";
   qty: number;
@@ -290,7 +296,7 @@ type ClosedPositionRow = {
   exit_price: number | null;
   pnl: number | null;
   exit_ts: string | null;
-  exit_reason: ExitTag | "manual" | "unknown";
+  close_reason: string | null;
 };
 
 const API_BASE = "";
@@ -305,7 +311,7 @@ const pageStyle: React.CSSProperties = {
 };
 
 const appShell: React.CSSProperties = {
-  maxWidth: 1400,
+  maxWidth: 1550,
   margin: "0 auto",
   padding: "16px 24px 40px",
 };
@@ -348,7 +354,7 @@ const tabButton = (active: boolean): React.CSSProperties => ({
 
 const gridRow: React.CSSProperties = {
   display: "grid",
-  gridTemplateColumns: "2.4fr 1.6fr",
+  gridTemplateColumns: "1.9fr 2.1fr",
   gap: 16,
   alignItems: "flex-start",
 };
@@ -535,6 +541,14 @@ export default function App() {
     error: null,
   });
 
+  type ClosedPosScope = "today" | "all";
+  const [closedPosScope, setClosedPosScope] = useState<ClosedPosScope>("today");
+  const [closedPositionRows, setClosedPositionRows] = useState<ClosedPositionRow[]>([]);
+  const [closedPositionsLoad, setClosedPositionsLoad] = useState<LoadState>({
+    loading: true,
+    error: null,
+  });
+
   const [apiLog, setApiLog] = useState<string[]>([]);
 
   const [selectedAccount, setSelectedAccount] = useState<string>("alpaca:paper");
@@ -668,6 +682,25 @@ export default function App() {
     };
 
 
+
+    const loadClosedPositions = async () => {
+      try {
+        setClosedPositionsLoad((s) => ({ ...s, loading: true, error: null }));
+        logApi(`GET /v1/closed_positions?scope=${closedPosScope}`);
+        const data = await fetchJson<{ closed_positions?: ClosedPositionRow[] }>(
+          `/v1/closed_positions?scope=${encodeURIComponent(closedPosScope)}&account=${encodeURIComponent(selectedAccount)}&limit=1000`
+        );
+        if (cancelled) return;
+        setClosedPositionRows((data as any).closed_positions ?? (data as any).items ?? []);
+        setClosedPositionsLoad({ loading: false, error: null });
+      } catch (err: any) {
+        if (cancelled) return;
+        setClosedPositionsLoad({
+          loading: false,
+          error: err?.message || String(err),
+        });
+      }
+    };
     // Fast truth path: Trader events (proxied by BrokerView).
     const es = new EventSource("/events");
 
@@ -676,6 +709,7 @@ export default function App() {
     // Refresh orders immediately when local UI submits an order
     const onOrdersRefresh = () => {
       loadOrders();
+    loadClosedPositions();
     };
     window.addEventListener("reflex:orders_refresh", onOrdersRefresh);
 
@@ -687,6 +721,7 @@ export default function App() {
           loadAccounts();
           loadPositions();
           loadOrders();
+    loadClosedPositions();
         }
       } catch {
         // ignore keepalive/pings
@@ -697,12 +732,14 @@ export default function App() {
     loadAccounts();
     loadPositions();
     loadOrders();
+    loadClosedPositions();
 
     const timer = setInterval(() => {
       loadSession();
       loadAccounts();
       loadPositions();
       loadOrders();
+    loadClosedPositions();
     }, 3000);
 
     return () => {
@@ -712,7 +749,7 @@ export default function App() {
       try { es.close(); } catch {}
 
     };
-  }, [selectedAccount]);
+  }, [selectedAccount, closedPosScope]);
   const closedKeys = useMemo(() => {
     const s = new Set<string>();
     for (const o of closedOrders) {
@@ -743,139 +780,13 @@ export default function App() {
   }, [activeOrders]);
 
   const closedPositions = useMemo((): ClosedPositionRow[] => {
-    // Derived view for live testing.
-    // A symbol is "closed" if it has a filled closing order and is not currently in open positions.
-    // We prefer Reflex-tagged exits (client_order_id contains :exit:stop/:exit:target) to classify reason.
-    // Entry/Exit prices come from filled_avg_price when available.
-
-    // IMPORTANT: treat qty==0 as NOT open. Some backends keep "positions" rows around at 0,
-    // which would otherwise suppress closed-position rendering.
-    const openSyms = new Set(
-      (positions || [])
-        .filter((p: any) => {
-          const sym = (p?.symbol || "").toString().toUpperCase();
-          if (!sym) return false;
-          const qRaw = (p as any).qty ?? (p as any).quantity ?? (p as any).position_qty;
-          const q = Number(qRaw);
-          return Number.isFinite(q) && Math.abs(q) > 1e-9;
-        })
-        .map((p: any) => (p.symbol || "").toString().toUpperCase())
-    );
-
-    // Group closed orders by symbol
-    const bySym = new Map<string, Order[]>();
-    for (const o of closedOrders) {
-      const sym = (o.symbol || "").toString().toUpperCase();
-      if (!sym) continue;
-      if (!bySym.has(sym)) bySym.set(sym, []);
-      bySym.get(sym)!.push(o);
-    }
-
-    // Helper: stable-ish sort by submitted_at/updated_at/created_at
-    const ordTs = (o: Order): string => (o.submitted_at || o.updated_at || o.created_at || "") as string;
-
-    // Helper: best effort numeric fill price
-    const fillPx = (o: Order): number | null => {
-      const v = (o as any).filled_avg_price;
-      if (v != null && v !== "") {
-        const n = Number(v);
-        if (Number.isFinite(n)) return n;
-      }
-      if (o.limit_price != null) {
-        const n = Number(o.limit_price);
-        if (Number.isFinite(n)) return n;
-      }
-      return null;
-    };
-
-    // Helper: base id prefix for entry/exit pairing
-    const baseId = (cid: string | null | undefined): string => {
-      const s = (cid || "").toString();
-      if (!s) return "";
-      return s.split(":")[0] || "";
-    };
-
-    const out: ClosedPositionRow[] = [];
-
-    for (const [sym, orders] of bySym.entries()) {
-      if (openSyms.has(sym)) continue;
-
-      const filled = orders.filter((o) => (o.status || "").toLowerCase() === "filled");
-      if (!filled.length) continue;
-
-      // Prefer a Reflex-tagged filled exit (stop/target). If none, fall back to last filled closing order.
-      const filledTaggedExit = filled
-        .filter((o) => (o.client_order_id || "").toString().includes(":exit:"))
-        .slice()
-        .sort((a, b) => ordTs(b).localeCompare(ordTs(a)))[0];
-
-      const filledSells = filled.filter((o) => (o.side || "").toLowerCase() === "sell");
-      const lastFilledSell = filledSells.slice().sort((a, b) => ordTs(b).localeCompare(ordTs(a)))[0];
-
-      // Choose exit order:
-      // - if we have tagged exit, use it (best for reason)
-      // - else use last filled sell
-      const exit = filledTaggedExit || lastFilledSell;
-      if (!exit) continue;
-
-      // Find entry:
-      // 1) If exit has a base prefix, look for matching :entry
-      // 2) Else, take last filled buy before the exit time
-      const exitBase = baseId(exit.client_order_id);
-      const filledEntries = filled.filter((o) => (o.client_order_id || "").toString().includes(":entry"));
-      let entry = exitBase
-        ? filledEntries.find((o) => baseId(o.client_order_id) === exitBase)
-        : undefined;
-
-      if (!entry) {
-        const exitTime = ordTs(exit);
-        const filledBuys = filled.filter((o) => (o.side || "").toLowerCase() === "buy");
-        entry = filledBuys
-          .filter((o) => ordTs(o) <= exitTime)
-          .slice()
-          .sort((a, b) => ordTs(b).localeCompare(ordTs(a)))[0];
-      }
-
-      const qty = exit.filled_qty != null ? Number(exit.filled_qty) : exit.qty != null ? Number(exit.qty) : 0;
-      // Entry price: best effort
-      // 1) matching filled entry order (preferred)
-      // 2) some brokers/servers may attach avg_entry/entry_price on the closing order payload
-      const entryPxFromEntry = entry ? fillPx(entry) : null;
-      const entryAltRaw = (exit as any).avg_entry_price ?? (exit as any).entry_price ?? (exit as any).avg_entry ?? null;
-      const entryAlt = entryAltRaw != null && entryAltRaw !== "" ? Number(entryAltRaw) : NaN;
-      const entryPx = entryPxFromEntry != null ? entryPxFromEntry : Number.isFinite(entryAlt) ? entryAlt : null;
-      const exitPx = fillPx(exit);
-      const exitTs = (exit.submitted_at || exit.updated_at || exit.created_at) ?? null;
-
-      // Realized P/L (best-effort). LONG: (exit-entry)*qty. SHORT: (entry-exit)*qty
-      let pnl: number | null = null;
-      if (entryPx != null && exitPx != null && Number.isFinite(entryPx) && Number.isFinite(exitPx) && Number.isFinite(qty)) {
-        const sideGuess: "LONG" | "SHORT" = (exit.side || "").toLowerCase() === "buy" ? "SHORT" : "LONG";
-        pnl = sideGuess === "SHORT" ? (entryPx - exitPx) * qty : (exitPx - entryPx) * qty;
-      }
-
-      let reason: ClosedPositionRow["exit_reason"] = "unknown";
-      const cid = (exit.client_order_id || "").toString();
-      if (cid.includes(":exit:stop")) reason = "stop";
-      else if (cid.includes(":exit:target")) reason = "target";
-      else if (cid) reason = "manual";
-
-      out.push({
-        account_id: (exit as any).account_id ?? null,
-        symbol: sym,
-        side: "LONG",
-        qty,
-        entry_price: entryPx,
-        exit_price: exitPx,
-        pnl,
-        exit_ts: exitTs,
-        exit_reason: reason,
-      });
-    }
-
-    out.sort((a, b) => (b.exit_ts || "").localeCompare(a.exit_ts || ""));
+    const rows = closedPositionRows || [];
+    // UI safety: keep deterministic sort (newest first) and local account filter as a backstop.
+    const out = rows.filter((r: any) => !selectedAccount || !r.account_id || r.account_id === selectedAccount);
+    out.sort((a: any, b: any) => String(b.exit_ts || "").localeCompare(String(a.exit_ts || "")));
     return out;
-  }, [closedOrders, positions]);
+  }, [closedPositionRows, selectedAccount]);
+
 
 
 
@@ -1157,10 +1068,18 @@ export default function App() {
     if (positionsLoad.loading && positions.length === 0) {
       return panel(<div style={smallText}>Loading positions…</div>);
     }
-    if (positionsLoad.error) {
+    const rawErr = positionsLoad.error;
+    const posErrMsg = rawErr
+      ? (String(rawErr).includes("502") || String(rawErr).toLowerCase().includes("trader unavailable")
+          ? "Positions temporarily unavailable (retrying…) — showing last known data."
+          : `Positions error: ${rawErr}`)
+      : null;
+
+    // If we have no cached positions, show the error inline.
+    if (rawErr && positions.length === 0) {
       return panel(
         <div style={{ ...smallText, color: "#fecaca" }}>
-          Positions error: {positionsLoad.error}
+          {posErrMsg}
         </div>
       );
     }
@@ -1202,10 +1121,25 @@ export default function App() {
     }
 
     return panel(
+      <div>
+        {posErrMsg ? <div style={{ ...smallText, color: "#fecaca", marginBottom: 6 }}>{posErrMsg}</div> : null}
       <table style={{ width: "100%", borderCollapse: "collapse", tableLayout: "fixed" }}>
+        <colgroup>
+          <col style={{ width: "12%" }} />
+          <col style={{ width: "6%" }} />
+          <col style={{ width: "8%" }} />
+          <col style={{ width: "8%" }} />
+          <col style={{ width: "12%" }} />
+          <col style={{ width: "12%" }} />
+          <col style={{ width: "12%" }} />
+          <col style={{ width: "12%" }} />
+          <col style={{ width: "12%" }} />
+          <col style={{ width: "6%" }} />
+        </colgroup>
           <thead>
             <tr style={{ borderBottom: "1px solid #111827" }}>
               <th style={thStyle}>Symbol</th>
+              <th style={thStyle}>PTI</th>
               <th style={thStyle}>Side</th>
               <th style={thStyle}>Qty</th>
               <th style={thStyle}>Avg Price</th>
@@ -1220,6 +1154,9 @@ export default function App() {
             {sorted.map((p) => (
               <tr key={`${p.account_id || ""}:${(p.symbol || "").toUpperCase()}`}>
                 <td style={tdStyle}>{p.symbol}</td>
+                <td style={tdStyle}>
+                  <span style={badge("#94a3b8")}>{(p.gen_id ?? "-").toString()}</span>
+                </td>
                 <td style={tdStyle}>
                   <span
                     style={badge(
@@ -1319,6 +1256,7 @@ export default function App() {
           </tbody>
 
       </table>
+      </div>
     );
   };
 
@@ -1842,15 +1780,41 @@ export default function App() {
         <div style={card}>
           <div style={cardHeaderRow}>
             <div style={cardTitle}>Closed positions</div>
-            <span style={smallText}>Derived from filled exits (fast truth view)</span>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+              <label style={smallText}>
+                Scope
+                <select
+                  style={{ ...selectStyle, width: 120, marginLeft: 8, padding: "4px 8px" }}
+                  value={closedPosScope}
+                  onChange={(e) => setClosedPosScope(e.target.value as any)}
+                >
+                  <option value="today">Today</option>
+                  <option value="all">All</option>
+                </select>
+              </label>
+              <span style={smallText}>Source: Trader /v1/portfolio/closed_positions</span>
+            </div>
           </div>
-          {closedPositions.length ? (
-            <div style={{ height: 220, overflowY: "auto", overflowX: "hidden", marginTop: 6 }}>
+          {closedPositionsLoad.error ? (
+            <div style={{ ...smallText, color: "#fecaca" }}>Closed positions error: {closedPositionsLoad.error}</div>
+          ) : closedPositions.length ? (
+            <div style={{ height: 240, overflowY: "auto", overflowX: "hidden", marginTop: 6 }}>
               <table style={{ width: "100%", borderCollapse: "collapse", tableLayout: "fixed" }}>
+                <colgroup>
+                  <col style={{ width: "18%" }} />
+                  <col style={{ width: "14%" }} />
+                  <col style={{ width: "6%" }} />
+                  <col style={{ width: "8%" }} />
+                  <col style={{ width: "14%" }} />
+                  <col style={{ width: "14%" }} />
+                  <col style={{ width: "12%" }} />
+                  <col style={{ width: "14%" }} />
+                </colgroup>
                 <thead>
                   <tr style={{ borderBottom: "1px solid #111827" }}>
                     <th style={thStyle}>Time</th>
                     <th style={thStyle}>Symbol</th>
+                    <th style={thStyle}>PTI</th>
                     <th style={thStyle}>Qty</th>
                     <th style={thStyle}>Entry</th>
                     <th style={thStyle}>Exit</th>
@@ -1865,6 +1829,7 @@ export default function App() {
                       <tr key={`closed:${r.symbol}:${r.exit_ts || ""}:${r.qty}:${idx}`}>
                         <td style={tdStyle}>{fmtTsNY(r.exit_ts || "")}</td>
                         <td style={tdStyle}>{r.symbol}</td>
+                        <td style={tdStyle}><span style={badge("#94a3b8")}>{(r.gen_id ?? "-").toString()}</span></td>
                         <td style={tdStyle}>{formatNumber(r.qty, 0)}</td>
                         <td style={tdStyle}>{r.entry_price != null ? formatCurrency(r.entry_price) : "-"}</td>
                         <td style={tdStyle}>{r.exit_price != null ? formatCurrency(r.exit_price) : "-"}</td>
@@ -1872,8 +1837,8 @@ export default function App() {
                           {r.pnl != null ? formatCurrency(r.pnl) : "-"}
                         </td>
                         <td style={tdStyle}>
-                          <span style={badge(r.exit_reason === "stop" ? "#f97316" : r.exit_reason === "target" ? "#22c55e" : "#e5e7eb")}>
-                            {r.exit_reason.toUpperCase()}
+                          <span style={badge(String((r.close_reason || "")).toUpperCase().startsWith("STOP") ? "#f97316" : String((r.close_reason || "")).toUpperCase().startsWith("TARGET") ? "#22c55e" : "#e5e7eb")}>
+                            {(r.close_reason || "CLOSED").toString()}
                           </span>
                         </td>
                       </tr>
@@ -1973,7 +1938,7 @@ export default function App() {
           </div>
           <div>
             <span style={smallText}>
-              Instance: <strong>liveA</strong> • <MarketClock />
+              Instance: <strong>live</strong> • <MarketClock />
             </span>
           </div>
         </header>

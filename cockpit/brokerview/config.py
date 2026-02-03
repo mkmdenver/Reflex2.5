@@ -32,7 +32,7 @@ class Settings:
         "postgresql://postgres:postgres@localhost:5432/brokers"
     )
 
-    INSTANCE = os.getenv("INSTANCE", "liveA")
+    INSTANCE = os.getenv("INSTANCE", "live")
     GARNET_URL = os.getenv("GARNET_URL", "redis://127.0.0.1:6379/0")
 
 settings = Settings()

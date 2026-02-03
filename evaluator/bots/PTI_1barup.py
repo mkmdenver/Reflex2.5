@@ -100,40 +100,6 @@ def _truthy(v: Any, default: bool = False) -> bool:
         return False
     return default
 
-
-def _with_instance_suffix(channel: str, instance_id: str, feed_mode: str) -> str:
-    """
-    Enforce instance-scoped intent channels in LIVE so Trader (liveA) sees them.
-
-    - Supports '{instance_id}' placeholder.
-    - If PTI_INTENT_CHANNEL is a bare base (eval.intent / manual.intent / eval.order_intent), auto-suffix.
-    - In REPLAY, leave channel as-is unless templated.
-    """
-    ch = (channel or "").strip()
-    if not ch:
-        return ch
-
-    inst = (instance_id or "").strip()
-    mode = (feed_mode or "").strip().upper()
-
-    if "{instance_id}" in ch:
-        return ch.replace("{instance_id}", inst)
-
-    if mode != "LIVE" or not inst:
-        return ch
-
-    if ch.endswith(f".{inst}"):
-        return ch
-
-    if ch in ("eval.intent", "manual.intent", "eval.order_intent"):
-        return f"{ch}.{inst}"
-
-    if ch.startswith("eval.intent.") or ch.startswith("manual.intent.") or ch.startswith("eval.order_intent."):
-        return ch
-
-    return ch
-
-
 def _resolve_path_under_root(path: str) -> str:
     p = (path or "").strip()
     if not p:
@@ -279,7 +245,6 @@ def _apply_record_path_stamping(path: str, run_id: str) -> str:
 
 @dataclass
 class Config:
-    instance_id: str
     run_id: str
     feed_mode: str  # LIVE / REPLAY
     redis_url: str
@@ -299,6 +264,8 @@ class Config:
     source: str
     strategy_id: str
     urgency: str
+
+    gen_id: str  # one-char intent generator id
 
     stop_buffer: float
 
@@ -320,9 +287,9 @@ class Config:
 
 
 def load_config() -> Config:
-    instance_id = _env("REFLEX_INSTANCE_ID", "liveA")
 
-    run_id = _env("REFLEX_RUN_ID")
+
+    run_id = _env("PTI_RUN_ID")
     if not run_id:
         run_id = f"run_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
 
@@ -332,30 +299,21 @@ def load_config() -> Config:
 
     redis_url = _env("GARNET_URL") or _env("REDIS_URL", "redis://127.0.0.1:6379/0")
 
+
     symbols = _csv_syms(_env("PTI_SYMBOLS", ""))
     if symbols:
         symbols_mode = "static"
     else:
-        symbols_mode = _env("PTI_SYMBOLS_MODE", "active_set").lower()
+        symbols_mode = _env("" \
+        "", "active_set").lower()
         if symbols_mode != "active_set":
             symbols_mode = "active_set"
 
     active_set_key = _env("PTI_ACTIVE_SET_KEY", "eval:fts_1barup:active")
     filter_stream_channel = _env("PTI_FILTER_STREAM_CHANNEL", "eval.1barup_filter_stream")
-
-    bars_channel = _env("PTI_BARS_CHANNEL")
-    if not bars_channel:
-        bars_channel = _env(
-            "REFLEX_DATAHUB_BARS1M_PUB_REPLAY" if feed_mode == "REPLAY" else "REFLEX_DATAHUB_BARS1M_PUB_LIVE",
-            "hub.bars1m.pub.replay" if feed_mode == "REPLAY" else "hub.bars1m.pub.live",
-        )
-
-    intent_channel = _env("PTI_INTENT_CHANNEL", "eval.intent")
-    intent_channel = _with_instance_suffix(intent_channel, instance_id, feed_mode)
-
-    intent_mode = _env("PTI_INTENT_MODE", "send").lower()
-    if intent_mode not in ("send", "record", "tee", "off"):
-        intent_mode = "send"
+    bars_channel = _env("PTI_BARS_CHANNEL","hub.bars1m.pub.live")
+    intent_channel = _env("PTI_INTENT_CHANNEL", "eval.intent.live")
+    intent_mode = _env("PTI_INTENT_MODE", "send")
 
     default_record = str(_repo_root / "evaluator" / "runs" / "pti_1barup" / "intents.jsonl")
     intent_record_path = _env("PTI_INTENT_RECORD_PATH", default_record)
@@ -365,6 +323,8 @@ def load_config() -> Config:
     account_id = _env("PTI_ACCOUNT_ID") or None
     source = _env("PTI_SOURCE", "bot")
     strategy_id = _env("PTI_STRATEGY_ID", "pti_1barup")
+
+    gen_id = _env("PTI_GEN_ID", "B").strip().upper()[:1] or "B"
     urgency = _env("PTI_URGENCY", "normal").lower()
 
     stop_buffer = float(_env("PTI_1BAR_STOP_BUFFER", "0.01"))
@@ -392,7 +352,6 @@ def load_config() -> Config:
         COMPONENT,
         "startup.config",
         extra={
-            "instance_id": instance_id,
             "run_id": run_id,
             "feed_mode": feed_mode,
             "redis_url": redis_url,
@@ -405,6 +364,7 @@ def load_config() -> Config:
             "intent_channel": intent_channel,
             "intent_record_path": intent_record_path,
             "strategy_id": strategy_id,
+            "gen_id": gen_id,
             "account_id": account_id,
             "request_tier": request_tier,
             "request_tier_name": request_tier_name,
@@ -419,7 +379,7 @@ def load_config() -> Config:
     )
 
     return Config(
-        instance_id=instance_id,
+
         run_id=run_id,
         feed_mode=feed_mode,
         redis_url=redis_url,
@@ -435,6 +395,7 @@ def load_config() -> Config:
         source=source,
         strategy_id=strategy_id,
         urgency=urgency,
+        gen_id=gen_id,
         stop_buffer=stop_buffer,
         request_tier=request_tier,
         request_tier_name=request_tier_name,
@@ -464,12 +425,11 @@ def make_sink(cfg: Config) -> IntentSink:
 # ---------------------------------------------------------------------------
 
 
-async def request_tier(symbol: str, tier: str, instance_id: str) -> None:
+async def request_tier(symbol: str, tier: str) -> None:
     evt = {
         "symbol": symbol.upper(),
         "tier": tier.upper(),
         "source": COMPONENT,
-        "instance_id": instance_id,
         "ts_ms": int(time.time() * 1000),
     }
     await publish_async(CHANNELS["raise"], evt)
@@ -523,7 +483,7 @@ async def _filter_stream_loop(cfg: Config, active: Set[str]) -> None:
                 log.info(COMPONENT, "filter.add", extra={"symbol": sym, "active_count": len(active)})
                 _evtlog(cfg, {"kind": "universe.add", "ts": time.time(), "symbol": sym, "active_count": len(active), "source": "filter_stream"})
                 if cfg.feed_mode == "LIVE" and cfg.request_tier:
-                    await request_tier(sym, cfg.request_tier_name, cfg.instance_id)
+                    await request_tier(sym, cfg.request_tier_name)
 
         elif kind == "remove":
             if sym in active:
@@ -560,7 +520,7 @@ async def _active_set_resync_loop(cfg: Config, active: Set[str]) -> None:
                 _evtlog(cfg, {"kind": "universe.resync.add", "ts": time.time(), "count": len(added), "symbols": list(sorted(added))[:50], "active_count": len(active)})
                 if cfg.feed_mode == "LIVE" and cfg.request_tier:
                     for sym in sorted(added):
-                        await request_tier(sym, cfg.request_tier_name, cfg.instance_id)
+                        await request_tier(sym, cfg.request_tier_name)
 
             if removed:
                 for sym in removed:
@@ -617,18 +577,40 @@ async def emit_intent_closed_up(
     r = max(0.0, c - initial_stop)
     targets: List[Dict[str, Any]] = [{"kind": "r_multiple", "r": 1.0}, {"kind": "r_multiple", "r": 2.0}] if r > 0 else []
 
-    trigger: Dict[str, Any] = {
-        "kind": "immediate",
-        "basis": "1m",
-        "condition": "close_gt_prev_close",
-        "bar_id_ms": int(bar_id_ms),
+        # Trigger (required): LIVE => now, REPLAY => schedule at bar/event timestamp
+    if cfg.feed_mode == "REPLAY":
+        trigger: Dict[str, Any] = {
+            "kind": "at_time",
+            "ts": event_ts or intent_ts,
+            "session": "ANY",
+            "params": {
+                "tolerance_ms": 500,
+                "late_action": "execute",
+            },
+        }
+    else:
+        trigger = {
+            "kind": "now",
+            "session": "ANY",
+            "params": {},
+        }
+
+    # Canonical intent models (LIVE + REPLAY share the same shape)
+    models: Dict[str, Any] = {
+        "entry": {"kind": "immediate", "params": {}},
+        "position_mgmt": {"kind": "none", "params": {}},
+        "profit": {"kind": "tslfe", "params": {}},
+        "stop": {"kind": "5pt_hard", "params": {"cents": 5}},
+        "exit": {"kind": "tslfe", "params": {}},
     }
-    if event_ts is not None:
-        trigger["bar_ts"] = event_ts
+
 
     # --- NEW canonical model fields (v1) ---
     # Entry is immediate for now. Profit uses TSLFE. Stop-loss is 5pt hard.
     intent: Dict[str, Any] = {
+        "schema": "reflex.intent.v3",
+        "mode": cfg.feed_mode,
+        "gen_id": cfg.gen_id,
         "intent_id": intent_id,
         "ts": intent_ts,
         "symbol": sym,
@@ -640,6 +622,7 @@ async def emit_intent_closed_up(
         "strength": float(strength),
         "urgency": cfg.urgency,
         "trigger": trigger,
+        "models": models,
         "reason": "1barup: 1m bar CLOSED up vs previous close (finalized on next bar)",
         "tags": ["1barup", "1m", "bar_close", "close_gt_prev_close"],
 
@@ -647,6 +630,7 @@ async def emit_intent_closed_up(
         "entry_model": "immediate",
         "position_mgmt_model": "none",
         "profit_model": "tslfe",
+        "stop_model": {"kind": "5pt_hard", "cents": 5},
         "stop_loss_model": "5pt_hard",
         "exit_model": "tslfe",
 
@@ -679,7 +663,6 @@ async def emit_intent_closed_up(
         "event_ts": event_ts,
         "emitted_ts": emitted_ts,
         "run_id": cfg.run_id,
-        "instance_id": cfg.instance_id,
         "source_component": COMPONENT,
         "intent": intent,
     }
@@ -890,7 +873,7 @@ async def run() -> None:
         _evtlog(cfg, {"kind": "universe.static", "ts": time.time(), "count": len(active), "symbols": list(cfg.symbols)[:200]})
         if cfg.feed_mode == "LIVE" and cfg.request_tier:
             for sym in sorted(active):
-                await request_tier(sym, cfg.request_tier_name, cfg.instance_id)
+                await request_tier(sym, cfg.request_tier_name)
     else:
         active = await _bootstrap_active_set(cfg)
         log.info(COMPONENT, "universe.active_set", extra={"count": len(active)})

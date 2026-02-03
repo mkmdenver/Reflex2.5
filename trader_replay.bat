@@ -4,10 +4,8 @@ setlocal EnableExtensions
 REM --- This BAT lives in repo root ---
 set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
-
 echo [RUNNING] "%~f0"
 echo [ROOT] "%ROOT%"
-
 cd /d "%ROOT%"
 
 REM --- Load .env + .env.local into THIS process ---
@@ -15,49 +13,119 @@ if not exist "%ROOT%\env.bat" (
   echo [ERROR] Missing "%ROOT%\env.bat"
   exit /b 1
 )
+
 call "%ROOT%\env.bat"
 if errorlevel 1 exit /b 1
 
 REM ===========================================================================
 REM REPLAY DEFAULTS (override in .env/.env.local if you want)
 REM ===========================================================================
+
 set "REFLEX_MODE=REPLAY"
-if "%REFLEX_INSTANCE_ID%"=="" set "REFLEX_INSTANCE_ID=replayA"
 
-REM Bars feed channel
-if "%BARS_CHANNEL%"=="" set "BARS_CHANNEL=hub.bars1m.pub.replay"
+if "%REFLEX_MODE%"=="LIVE" (
+  set "ORDER_CHANNEL=trader.orders.live"
+  set "BOT_INTENT_CHANNEL=eval.intent.live"
+  set "BARS_CHANNEL=hub.bars1m.pub.live"
+  set "TICKS_CHANNEL=hub.ticks.pub.live"
+  set "MANUAL_INTENT_CHANNEL=eval.intent.manual.live"
 
-REM Canonical intent channels (instance-scoped)
-if "%BOT_INTENT_CHANNEL%"=="" set "BOT_INTENT_CHANNEL=eval.intent.%REFLEX_INSTANCE_ID%"
-if "%MANUAL_INTENT_CHANNEL%"=="" set "MANUAL_INTENT_CHANNEL=manual.intent.%REFLEX_INSTANCE_ID%"
+) else (
+  set "BOT_INTENT_CHANNEL=eval.intent.replay"
+  set "ORDER_CHANNEL=trader.orders.replay"
+  set "BARS_CHANNEL=hub.bars1m.pub.replay"
+  set "TICKS_CHANNEL=hub.ticks.pub.replay"
+  set "MANUAL_INTENT_CHANNEL=eval.intent.manual.replay"
+)
 
-REM Back-compat aliases (some tools still use these)
-if "%PTI_INTENT_CHANNEL%"=="" set "PTI_INTENT_CHANNEL=%BOT_INTENT_CHANNEL%"
-if "%INTENT_CHANNEL%"=="" set "INTENT_CHANNEL=%BOT_INTENT_CHANNEL%"
+REM Defaults
+if "%TRADER_API_PORT%"=="" set "TRADER_API_PORT=7002"
+if "%COCKPIT_PORT%"=="" set "COCKPIT_PORT=7010"
 
-REM Safety: prefer SIM-only in replay unless you explicitly override elsewhere
-if "%TRADER_BROKER_MODE%"=="" set "TRADER_BROKER_MODE=SIM"
-if "%ALPACA_ENABLED%"=="" set "ALPACA_ENABLED=0"
+REM ---------------------------------------------------------------------------
+REM Logging / instrumentation (same as LIVE unless you override)
+REM ---------------------------------------------------------------------------
 
-REM Defaults (use different ports to avoid stomping LIVE)
-if "%TRADER_API_PORT%"=="" set "TRADER_API_PORT=7012"
-if "%COCKPIT_PORT%"=="" set "COCKPIT_PORT=7020"
+set TRADER_EVENT_LOG_ENABLE=1
+set TRADER_EVENT_LOG_PATH=logs/trader_events.jsonl
+set TRADER_ORDER_LOG_ENABLE=1
+set TRADER_ORDER_LOG_PATH=logs/orders_events.jsonl
+set TRADER_LOG_TO_FILE=1
+set TRADER_LOG_PATH=logs/trader.log
+set TSLFE_EPS_PRICE=0.01
+set TSLFE_TBE_WINDOW=25
+set TSLFE_TRIM_TH=1.8
+set TSLFE_FLATTEN_TH=2.6
+set TSLFE_TRIM_PCT=0.2
+set TSLFE_MIN_TRIM_INTERVAL_S=2.0
+set TRADER_METRICS_EMIT_SECS=1
 
-echo.
-echo ================== ENV SUMMARY (Trader REPLAY) =================
+REM enable stall-based exit
+set TRADER_TSLFE_ENABLED=1
+set TRADER_TSLFE_EPS_PRICE=0.02
+set TRADER_TSLFE_TBE_WINDOW=15
+set TRADER_TSLFE_MIN_SAMPLES=12
+set TRADER_TSLFE_FLATTEN_TH=1.8
+set TRADER_EXIT_MODEL_DEFAULT=tslfe
+set TRADER_METRICS_EMIT_SECS=1
+set TRADER_TSLFE_PROFIT_EXIT_NORM_TH=2.0
+
+set FLATTEN_CHASE_ENABLE=1
+set FLATTEN_ATTEMPTS=8
+set FLATTEN_SLEEP_MS=700
+set FLATTEN_MAX_SLIPPAGE_PCT=3.0
+set FLATTEN_STEP_PCT=0.3
+
+REM ---------------------------------------------------------------------------
+REM Display all configured environment variables
+REM ---------------------------------------------------------------------------
+
+echo ================== ENV SUMMARY (Trader REPLAY) ==================
+
+echo TRADER_EVENT_LOG_ENABLE : %TRADER_EVENT_LOG_ENABLE%
+echo TRADER_EVENT_LOG_PATH   : %TRADER_EVENT_LOG_PATH%
 echo REFLEX_MODE         : %REFLEX_MODE%
 echo REFLEX_INSTANCE_ID  : %REFLEX_INSTANCE_ID%
 echo REDIS               : %GARNET_URL%
 echo BARS_CHANNEL        : %BARS_CHANNEL%
 echo BOT_INTENT_CHANNEL  : %BOT_INTENT_CHANNEL%
 echo MANUAL_INTENT_CH    : %MANUAL_INTENT_CHANNEL%
-echo TRADER_BROKER_MODE  : %TRADER_BROKER_MODE%
-echo ALPACA_ENABLED      : %ALPACA_ENABLED%
 echo TRADER_API_PORT     : %TRADER_API_PORT%
 echo COCKPIT_PORT        : %COCKPIT_PORT%
 echo ROOT                : %CD%
-echo ==============================================================
-echo.
+
+echo =============================================================
+echo [ENV] TRADER_TSLFE_EPS_PRICE : %TRADER_TSLFE_EPS_PRICE%
+echo [ENV] TRADER_TSLFE_TBE_WINDOW : %TRADER_TSLFE_TBE_WINDOW%
+echo [ENV] TRADER_TSLFE_MIN_SAMPLES : %TRADER_TSLFE_MIN_SAMPLES%
+echo [ENV] TRADER_TSLFE_PROFIT_EXIT_NORM_TH : %TRADER_TSLFE_PROFIT_EXIT_NORM_TH%
+echo [ENV] FLATTEN_CHASE_ENABLE : %FLATTEN_CHASE_ENABLE%
+echo [ENV] FLATTEN_ATTEMPTS : %FLATTEN_ATTEMPTS%
+echo [ENV] FLATTEN_SLEEP_MS : %FLATTEN_SLEEP_MS%
+echo [ENV] FLATTEN_MAX_SLIPPAGE_PCT : %FLATTEN_MAX_SLIPPAGE_PCT%
+echo [ENV] FLATTEN_STEP_PCT : %FLATTEN_STEP_PCT%
+echo [ENV] TRADER_EVENT_LOG_ENABLE : %TRADER_EVENT_LOG_ENABLE%
+echo [ENV] TRADER_EVENT_LOG_PATH   : %TRADER_EVENT_LOG_PATH%
+echo [ENV] TRADER_ORDER_LOG_ENABLE : %TRADER_ORDER_LOG_ENABLE%
+echo [ENV] TRADER_ORDER_LOG_PATH   : %TRADER_ORDER_LOG_PATH%
+echo [ENV] TRADER_LOG_TO_FILE      : %TRADER_LOG_TO_FILE%
+echo [ENV] TRADER_LOG_PATH         : %TRADER_LOG_PATH%
+echo [ENV] TSLFE_EPS_PRICE       : %TSLFE_EPS_PRICE%
+echo [ENV] TSLFE_TBE_WINDOW      : %TSLFE_TBE_WINDOW%
+echo [ENV] TSLFE_TRIM_TH         : %TSLFE_TRIM_TH%
+echo [ENV] TSLFE_FLATTEN_TH      : %TSLFE_FLATTEN_TH%
+echo [ENV] TSLFE_TRIM_PCT        : %TSLFE_TRIM_PCT%
+echo [ENV] TSLFE_MIN_TRIM_INTERVAL_S : %TSLFE_MIN_TRIM_INTERVAL_S%
+echo [ENV] TRADER_METRICS_EMIT_SECS : %TRADER_METRICS_EMIT_SECS%
+echo [ENV] TRADER_TSLFE_ENABLED : %TRADER_TSLFE_ENABLED%
+echo [ENV] TRADER_TSLFE_EPS_PRICE : %TRADER_TSLFE_EPS_PRICE%
+echo [ENV] TRADER_TSLFE_TBE_WINDOW : %TRADER_TSLFE_TBE_WINDOW%
+echo [ENV] TRADER_TSLFE_MIN_SAMPLES : %TRADER_TSLFE_MIN_SAMPLES%
+echo [ENV] TRADER_TSLFE_FLATTEN_TH : %TRADER_TSLFE_FLATTEN_TH%
+echo [ENV] TRADER_TSLFE_PROFIT_EXIT_NORM_TH : %TRADER_TSLFE_PROFIT_EXIT_NORM_TH%
+echo [ENV] TRADER_TSLFE_FLATTEN_TH : %TRADER_TSLFE_FLATTEN_TH%
+echo [ENV] TRADER_EXIT_MODEL_DEFAULT : %TRADER_EXIT_MODEL_DEFAULT%
+echo [ENV] ORDER_CHANNEL : %ORDER_CHANNEL%
 
 if not exist "%ROOT%\.venv\Scripts\python.exe" (
   echo [ERROR] Missing venv python: "%ROOT%\.venv\Scripts\python.exe"
@@ -67,50 +135,47 @@ if not exist "%ROOT%\.venv\Scripts\python.exe" (
 REM ---------------------------------------------------------------------------
 REM Trader API (resident)
 REM ---------------------------------------------------------------------------
+
 echo [LAUNCH] Trader API on :%TRADER_API_PORT%
-start "Trader:api(replay)" cmd /k ""%ROOT%\.venv\Scripts\python.exe" -u -m uvicorn trader.app:app --host 127.0.0.1 --port %TRADER_API_PORT%"
+start "Trader:api" /min cmd /k ""%ROOT%\.venv\Scripts\python.exe" -u -m uvicorn trader.app:app --host 127.0.0.1 --port %TRADER_API_PORT%"
 
-REM ---------------------------------------------------------------------------
-REM Resident workers
+REM Resident workers (start if present)
 REM ---------------------------------------------------------------------------
 
+REM Market-data worker (ticks/quotes/bars listener used by trade mgmt)
 if exist "%ROOT%\trader\md_worker.py" (
-  echo [LAUNCH] Trader md worker (replay)
-  start "Trader:md(replay)" cmd /k ""%ROOT%\.venv\Scripts\python.exe" -u -m trader.md_worker"
+  echo [LAUNCH] Trader md worker
+  start "Trader:md" /min cmd /k ""%ROOT%\.venv\Scripts\python.exe" -u -m trader.md_worker"
 ) else (
   echo [SKIP] trader\md_worker.py not found
 )
 
+REM Broker worker (Redis intents -> POST /v1/intents)
 if exist "%ROOT%\trader\broker_worker.py" (
-  echo [LAUNCH] Trader broker worker (replay)
-  start "Trader:broker(replay)" cmd /k ""%ROOT%\.venv\Scripts\python.exe" -u -m trader.broker_worker"
+  echo [LAUNCH] Trader broker worker
+  start "Trader:broker" /min cmd /k ""%ROOT%\.venv\Scripts\python.exe" -u -m trader.broker_worker"
 ) else (
   echo [SKIP] trader\broker_worker.py not found
 )
 
+REM Intent worker (observer)
 if exist "%ROOT%\trader\intent_worker.py" (
-  echo [LAUNCH] Trader intent worker (observer, replay)
-  start "Trader:intents(replay)" cmd /k ""%ROOT%\.venv\Scripts\python.exe" -u -m trader.intent_worker"
+  echo [LAUNCH] Trader intent worker
+  start "Trader:intents" /min cmd /k ""%ROOT%\.venv\Scripts\python.exe" -u -m trader.intent_worker"
 ) else (
   echo [SKIP] trader\intent_worker.py not found
 )
 
 REM ---------------------------------------------------------------------------
-REM Views (optional in replay; start if present)
+REM Cockpit (start ONCE)
 REM ---------------------------------------------------------------------------
+
 if exist "%ROOT%\brokerview.bat" (
-  echo [LAUNCH] BrokerView on :%COCKPIT_PORT% (replay)
-  start "BrokerView(replay)" cmd /k ""%ROOT%\brokerview.bat""
+  echo [LAUNCH] BrokerView on :%COCKPIT_PORT%
+  start "BrokerView" /min cmd /k ""%ROOT%\brokerview.bat""
   start "" "http://127.0.0.1:%COCKPIT_PORT%/"
 ) else (
   echo [SKIP] brokerview.bat not found
-)
-
-if exist "%ROOT%\traderview.bat" (
-  echo [LAUNCH] TradeView (replay)
-  start "TradeView(replay)" cmd /k ""%ROOT%\traderview.bat""
-) else (
-  echo [SKIP] traderview.bat not found
 )
 
 endlocal

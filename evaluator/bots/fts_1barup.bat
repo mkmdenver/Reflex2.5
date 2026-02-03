@@ -21,7 +21,7 @@ echo [PATH] ROOT=%ROOT%
 
 REM --- set identity (safe defaults) ---
 if "%REFLEX_MODE%"=="" set "REFLEX_MODE=LIVE"
-if "%REFLEX_INSTANCE_ID%"=="" set "REFLEX_INSTANCE_ID=liveA"
+if "%REFLEX_INSTANCE_ID%"=="" set "REFLEX_INSTANCE_ID=live"
 if "%REFLEX_RUN_ID%"=="" set "REFLEX_RUN_ID=run0"
 
 echo [ENV] REFLEX_MODE=%REFLEX_MODE%

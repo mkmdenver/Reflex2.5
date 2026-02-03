@@ -40,7 +40,7 @@ if not exist "%PY%" (
 REM --- Defaults ---
 if not defined TRADER_API_PORT set "TRADER_API_PORT=7002"
 if not defined COCKPIT_PORT set "COCKPIT_PORT=7010"
-if not defined REFLEX_INSTANCE_ID set "REFLEX_INSTANCE_ID=liveA"
+if not defined REFLEX_INSTANCE_ID set "REFLEX_INSTANCE_ID=live"
 
 echo [RUN] Trader API on %TRADER_API_PORT% (instance=%REFLEX_INSTANCE_ID%)
 start "Trader:api:%TRADER_API_PORT%" cmd /k ""%PY%" -m uvicorn trader.app:app --host 0.0.0.0 --port %TRADER_API_PORT% --log-level info"

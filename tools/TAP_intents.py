@@ -17,46 +17,11 @@ from common.bus import subscribe, unpack, CHANNELS  # type: ignore
 
 COMPONENT = "tools.tap_intents"
 
-def _with_instance_suffix(channel: str, instance_id: str, reflex_mode: str) -> str:
-    ch = (channel or "").strip()
-    if not ch:
-        return ch
-
-    # allow explicit templating
-    if "{instance_id}" in ch:
-        return ch.replace("{instance_id}", instance_id)
-
-    if (reflex_mode or "").upper() != "LIVE":
-        return ch
-
-    inst = (instance_id or "").strip()
-    if not inst:
-        return ch
-
-    if ch.endswith(f".{inst}"):
-        return ch
-
-    if ch in ("eval.intent", "manual.intent"):
-        return f"{ch}.{inst}"
-
-    if ch.startswith("eval.intent.") or ch.startswith("manual.intent."):
-        return ch
-
-    return ch
-
 def _env(name: str, default: str = "") -> str:
     v = os.getenv(name)
     return v.strip() if v and v.strip() else default
 
-
-def _resolve_intent_channel() -> str:
-    # Allow override (rare), otherwise use canonical bus channel
-    ch = _env("REFLEX_INTENTS_PUB", _env("PTI_INTENT_CHANNEL", CHANNELS.get("order", "eval.order_intent")))
-    return _with_instance_suffix(ch, _env("REFLEX_INSTANCE_ID", ""), _env("REFLEX_MODE", ""))
-
-
 INTENT_TAP_VERBOSE = _env("INTENT_TAP_VERBOSE", "0").lower() in ("1", "true", "yes", "on")
-
 
 async def run() -> None:
     """
@@ -66,7 +31,7 @@ async def run() -> None:
     - Logs a compact summary for each intent envelope.
     - Optional full envelope dump if INTENT_TAP_VERBOSE=1.
     """
-    channel = _resolve_intent_channel()
+    channel =  _env("PTI_INTENT_CHANNEL", "eval.order_intent.live")
 
     log.info(
         COMPONENT,

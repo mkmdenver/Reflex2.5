@@ -15,6 +15,9 @@ if not exist "%ROOT%\.venv\Scripts\python.exe" (
   exit /b 1
 )
 
+set "PTI_FEED_MODE=LIVE" 
+set "PTI_INTENT_CHANNEL=eval.intent.live"
+
 echo [RUNNING] "%ROOT%\tools\tap_intents.py"
 "%ROOT%\.venv\Scripts\python.exe" "%ROOT%\tools\TAP_intents.py" %*
 

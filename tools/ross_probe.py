@@ -12,7 +12,7 @@ if ROOT not in sys.path:
 from common.bus import subscribe, unpack, publish_async, CHANNELS  # type: ignore
 
 
-INSTANCE = os.getenv("INSTANCE", "liveA")
+INSTANCE = os.getenv("INSTANCE", "live")
 ACCOUNT_ID = os.getenv("ROSS_PROBE_ACCOUNT", "sim:cash")
 
 # Should match tools/ross_filter.py

@@ -11,7 +11,7 @@ from datahub.ingest_router import Router
 from datahub.subscriptions import SubManager
 from datahub.flag_listener import FlagListener
 from datahub.tier_listener import TierListener
-from datahub.adapters.live_adapter import LIVEAdapter
+from datahub.adapters.live_adapter import livedapter
 from datahub.adapters.replay_adapter import ReplayAdapter
 
 Mode = Literal["LIVE", "REPLAY"]
@@ -27,9 +27,9 @@ class LiveFeedWrapper:
     """
     Adapter wrapper used by SubManager in LIVE mode.
 
-    Translates tier operations into LIVEAdapter.subscribe() calls.
+    Translates tier operations into livedapter.subscribe() calls.
     """
-    def __init__(self, adapter: LIVEAdapter):
+    def __init__(self, adapter: livedapter):
         self.adapter = adapter
 
     def sub_trades(self, symbol: str) -> None:
@@ -84,7 +84,7 @@ class ReplayFeedWrapper:
 @dataclass
 class HubCore:
     mode: Mode
-    adapter: object          # LIVEAdapter | ReplayAdapter
+    adapter: object          # livedapter | ReplayAdapter
     router: Router
     subman: SubManager
     flag_listener: FlagListener
@@ -136,7 +136,7 @@ async def _stream_loop(adapter: object, router: Router) -> None:
 
     def _run_blocking() -> None:
         try:
-            # LIVEAdapter has open(); ReplayAdapter usually has start().
+            # livedapter has open(); ReplayAdapter usually has start().
             if hasattr(adapter, "open"):
                 adapter.open()  # type: ignore[attr-defined]
             elif hasattr(adapter, "start"):
@@ -174,7 +174,7 @@ def _build_live_core() -> HubCore:
     cfg = load_cfg()
     live_cfg = cfg.live
 
-    adapter = LIVEAdapter(
+    adapter = livedapter(
         api_key=live_cfg.polygon_ws_key or live_cfg.polygon_rest_key or "",
         ws_url=None,
     )

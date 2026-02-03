@@ -1,4 +1,4 @@
-@echo off
+REM @echo off
 REM env.bat — load .env and .env.local into the CURRENT process environment.
 REM IMPORTANT: Do NOT use setlocal/endlocal in this file, or variables vanish on return.
 REM CONTRACT:
