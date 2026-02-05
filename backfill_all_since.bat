@@ -46,10 +46,10 @@ echo [RUN] MINUTE backfill ALL since %SINCE%
 "%PY%" -m %MODULE% --kind minute --symbol ALL --since %SINCE%
 if errorlevel 1 exit /b %errorlevel%
 
-echo.
-echo [RUN] TICK backfill ALL since %SINCE%
-"%PY%" -m %MODULE% --kind tick --symbol ALL --since %SINCE%
-if errorlevel 1 exit /b %errorlevel%
+REM echo.
+REM echo [RUN] TICK backfill ALL since %SINCE%
+REM "%PY%" -m %MODULE% --kind tick --symbol ALL --since %SINCE%
+REM if errorlevel 1 exit /b %errorlevel%
 
 echo.
 echo [DONE] Backfill ALL complete.

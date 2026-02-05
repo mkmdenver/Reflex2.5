@@ -9,15 +9,18 @@ Acts as a thin, opinionated proxy between the browser UI and the Trader API.
 
 from __future__ import annotations
 
+import asyncio
+
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
@@ -52,17 +55,6 @@ TRADER_BASE = _env("TRADER_BASE", f"http://127.0.0.1:{TRADER_API_PORT}")
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 log.info("BrokerView config port=%s trader_base=%s root=%s", BROKERVIEW_PORT, TRADER_BASE, ROOT)
-
-# ---------------------------------------------------------------------------
-# UI stability caches (in-memory, per BrokerView process).
-# Goal: avoid scary 5xx flashes in the UI during refresh bursts or transient
-# Trader hiccups. We serve last-known-good snapshots when Trader is unavailable.
-# This is intentionally simple and low-risk (no persistence, no refactor).
-# ---------------------------------------------------------------------------
-_CACHE_POSITIONS: dict[str, PositionsResponse] = {}
-_CACHE_ORDERS: dict[str, OrdersResponse] = {}           # key = "{account}:{status}"
-_CACHE_CLOSED_POS: dict[str, dict[str, Any]] = {}       # key = "{account}:{scope}"
-
 
 
 class OrderIn(BaseModel):
@@ -104,6 +96,65 @@ app.add_middleware(
 static_dir = os.path.join(ROOT, "cockpit", "brokerview", "templates", "dist", "assets")
 if os.path.isdir(static_dir):
     app.mount("/assets", StaticFiles(directory=static_dir), name="assets")
+
+
+# ---------------------------------------------------------------------------
+# Soft-cache to eliminate UI error flashes
+# On upstream failure (Trader busy/restarting), return last-known-good snapshots.
+# ---------------------------------------------------------------------------
+
+# HARD RULE: BrokerView never invents state. Cache is only "last known good".
+_LAST_ACCOUNTS: Optional[AccountsResponse] = None
+_LAST_POSITIONS: Optional[PositionsResponse] = None
+_LAST_ORDERS: Optional[OrdersResponse] = None
+
+_OK_SINCE: Dict[str, float] = {}
+_LAST_ERR: Dict[str, str] = {}
+
+
+def _mark_ok(kind: str) -> None:
+    _OK_SINCE[kind] = time.time()
+    _LAST_ERR.pop(kind, None)
+
+
+def _mark_err(kind: str, err: Exception) -> None:
+    _LAST_ERR[kind] = repr(err)
+
+
+def _get_cached(kind: str):
+    if kind == "accounts":
+        return _LAST_ACCOUNTS
+    if kind == "positions":
+        return _LAST_POSITIONS
+    if kind == "orders":
+        return _LAST_ORDERS
+    return None
+
+
+def _model_allowed_keys(model_cls) -> set[str]:
+    # Pydantic v2: model_fields; v1: __fields__
+    mf = getattr(model_cls, "model_fields", None)
+    if isinstance(mf, dict):
+        return set(mf.keys())
+    ff = getattr(model_cls, "__fields__", None)
+    if isinstance(ff, dict):
+        return set(ff.keys())
+    return set()
+
+
+def _build_doc(model_cls, payload: Dict[str, Any]):
+    # Filter payload to model fields to avoid validation errors / strict models
+    allowed = _model_allowed_keys(model_cls)
+    if allowed:
+        payload = {k: v for k, v in payload.items() if k in allowed}
+    try:
+        # pydantic v2
+        mv = getattr(model_cls, "model_validate", None)
+        if callable(mv):
+            return mv(payload)
+    except Exception:
+        pass
+    return model_cls(**payload)
 
 
 @app.get("/v1/time")
@@ -214,7 +265,9 @@ async def accounts() -> AccountsResponse:
                     items = []
             except httpx.HTTPError as e:
                 log.exception("Error fetching accounts from Trader: %s", e)
-                raise HTTPException(status_code=502, detail="Trader unavailable")
+                return AccountsResponse(items=[])
+
+                return AccountsResponse(items=[])
 
     out: List[AccountSummary] = []
     for it in items:
@@ -263,177 +316,120 @@ async def accounts() -> AccountsResponse:
 async def positions(account: Optional[str] = None) -> PositionsResponse:
     """
     Proxy positions from Trader.
-    UI sends ?account=<account_id>; Trader expects ?account_id=<account_id>.
+
+    Behavior: on transient Trader failures, return last-known-good positions
+    (or empty). This keeps the UI stable during refresh bursts.
     """
     params: Dict[str, Any] = {}
     if account:
         params["account_id"] = account
 
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx.AsyncClient(timeout=5) as client:
         try:
             resp = await client.get(f"{TRADER_BASE}/v1/portfolio/positions", params=params)
             resp.raise_for_status()
-        except httpx.HTTPError as e:
-            log.warning("Trader unavailable for positions; serving cached snapshot (%s)", e)
-            cache_key = str(account or "")
-            cached = _CACHE_POSITIONS.get(cache_key)
+            raw = resp.json() if resp.content else {}
+        except Exception as e:
+            _mark_err("positions", e)
+            cached = _get_cached("positions")
             if cached is not None:
                 return cached
             return PositionsResponse(positions=[])
 
-        raw = resp.json()
+    top_account_id = raw.get("account_id") or (account or "")
+    docs: List[PositionDoc] = []
+    raw_positions = raw.get("positions") or raw.get("items") or []
+    for p in raw_positions:
+        qty = p.get("qty") or 0.0
+        side = p.get("side")
+        if side is None:
+            if qty > 0:
+                side = "long"
+            elif qty < 0:
+                side = "short"
+        try:
+            payload = {
+                "account_id": p.get("account_id") or top_account_id,
+                "symbol": p.get("symbol", ""),
+                "qty": qty,
+                "avg_price": p.get("avg_price") or p.get("avg_entry_price") or 0.0,
+                "market_value": p.get("market_value"),
+                "unrealized_pl": p.get("unrealized_pl"),
+                "stop_price": p.get("stop_price"),
+                "target_price": p.get("target_price"),
+                "close_reason": p.get("close_reason"),
+                "gen_id": p.get("gen_id"),
+                "side": side,
+                "raw": p,
+            }
+            docs.append(_build_doc(PositionDoc, payload))
+        except Exception:
+            # Skip malformed rows; never fail the whole endpoint
+            continue
 
-        # Trader returns {"items":[...], "account_id":"alpaca:paper"} but items often lack account_id.
-        top_account_id = raw.get("account_id") or (account or "")
-
-        docs: List[PositionDoc] = []
-        raw_positions = raw.get("positions") or raw.get("items") or []
-        for p in raw_positions:
-            qty = p.get("qty") or 0.0
-            side = p.get("side")
-            if side is None:
-                if qty > 0:
-                    side = "long"
-                elif qty < 0:
-                    side = "short"
-
-            docs.append(
-                PositionDoc(
-                    account_id=p.get("account_id") or top_account_id,
-                    symbol=p.get("symbol", ""),
-                    qty=qty,
-                    avg_price=p.get("avg_price") or 0.0,
-                    market_price=p.get("market_price"),
-                    market_value=p.get("market_value"),
-                    unrealized_pl=p.get("unrealized_pl"),
-                    unrealized_plpc=p.get("unrealized_plpc"),
-                    realized_pl=p.get("realized_pl"),
-                    side=side,
-                    stop_price=p.get("stop_price"),
-                    target_price=p.get("target_price"),
-                    take_profit_price=p.get("take_profit_price"),
-                    gen_id=p.get("gen_id"),
-                    raw=p,
-                )
-            )
-
-        resp_doc = PositionsResponse(positions=docs)
-        _CACHE_POSITIONS[str(account or "")] = resp_doc
-        return resp_doc
+    out = PositionsResponse(positions=docs)
+    global _LAST_POSITIONS
+    _LAST_POSITIONS = out
+    _mark_ok("positions")
+    return out
 
 
-
-@app.get("/v1/closed_positions")
-async def api_closed_positions(scope: str = "today", account: str | None = None, limit: int = 1000):
-    """Proxy Trader's canonical closed positions endpoint for the UI.
-
-    UI stability rule: never throw 5xx due to transient Trader hiccups.
-    If Trader is unavailable, serve last-known-good closed positions for the
-    requested (account, scope). If none exist yet, return an empty list.
-    """
-    acct = str(account or "")
-    sc = str(scope or "today")
-    cache_key = f"{acct}:{sc}"
-    params: dict[str, object] = {"scope": sc, "limit": int(limit)}
-    if account:
-        params["account_id"] = acct
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(f"{TRADER_BASE}/v1/portfolio/closed_positions", params=params)
-        resp.raise_for_status()
-        data = resp.json() if resp.content else {}
-        items = (data.get("items") if isinstance(data, dict) else None) or []
-        out = {"closed_positions": items}
-        _CACHE_CLOSED_POS[cache_key] = out
-        return out
-    except Exception as e:
-        log.warning("Trader unavailable for closed_positions; serving cached snapshot (%s)", e)
-        cached = _CACHE_CLOSED_POS.get(cache_key)
-        if cached is not None:
-            return cached
-        return {"closed_positions": []}
 
 @app.get("/v1/orders", response_model=OrdersResponse)
-async def orders(status: str = "all", account: Optional[str] = None) -> OrdersResponse:
+async def orders(account: Optional[str] = None, status: Optional[str] = None) -> OrdersResponse:
     """
-    Proxy orders from Trader and normalize into OrderDoc.
+    Proxy orders from Trader.
 
-    Supports:
-      - active
-      - closed
-      - all (active + closed)
-
-    IMPORTANT: passes selected account to Trader so it doesn't scan all accounts.
+    Behavior: on transient Trader failures, return last-known-good orders
+    (or empty) to eliminate scary UI flashes.
     """
-    want_all = str(status or "").lower() == "all"
-    params_base: Dict[str, Any] = {}
+    params: Dict[str, Any] = {}
     if account:
-        params_base["account_id"] = account
+        params["account_id"] = account
+    if status:
+        params["status"] = status
 
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx.AsyncClient(timeout=5) as client:
         try:
-            if want_all:
-                p1 = dict(params_base, status="active")
-                p2 = dict(params_base, status="closed")
-                r1 = await client.get(f"{TRADER_BASE}/v1/orders", params=p1)
-                r2 = await client.get(f"{TRADER_BASE}/v1/orders", params=p2)
-                r1.raise_for_status()
-                r2.raise_for_status()
-                j1 = r1.json()
-                j2 = r2.json()
-                raw_orders = (j1.get("orders") or j1.get("items") or []) + (j2.get("orders") or j2.get("items") or [])
-            else:
-                p = dict(params_base, status=status)
-                resp = await client.get(f"{TRADER_BASE}/v1/orders", params=p)
-                resp.raise_for_status()
-                j = resp.json()
-                raw_orders = j.get("orders") or j.get("items") or []
-        except httpx.HTTPError as e:
-            log.warning("Trader unavailable for orders; serving cached snapshot (%s)", e)
-            acct = str(account or "")
-            if want_all:
-                a = _CACHE_ORDERS.get(f"{acct}:active")
-                c = _CACHE_ORDERS.get(f"{acct}:closed")
-                merged: List[OrderDoc] = []
-                if a is not None:
-                    merged.extend(a.orders)
-                if c is not None:
-                    merged.extend(c.orders)
-                return OrdersResponse(orders=merged)
-            key = f"{acct}:{str(status or '').lower()}"
-            cached = _CACHE_ORDERS.get(key)
+            resp = await client.get(f"{TRADER_BASE}/v1/orders", params=params)
+            resp.raise_for_status()
+            raw = resp.json() if resp.content else {}
+        except Exception as e:
+            _mark_err("orders", e)
+            cached = _get_cached("orders")
             if cached is not None:
                 return cached
             return OrdersResponse(orders=[])
 
+    items = raw.get("items") or raw.get("orders") or []
     docs: List[OrderDoc] = []
-    for o in raw_orders:
-        docs.append(
-            OrderDoc(
-                account_id=o.get("account_id", ""),
-                symbol=o.get("symbol", ""),
-                side=o.get("side"),
-                status=o.get("status"),
-                type=o.get("type"),
-                qty=o.get("qty"),
-                filled_qty=o.get("filled_qty"),
-                limit_price=o.get("limit_price"),
-                stop_price=o.get("stop_price"),
-                time_in_force=o.get("time_in_force"),
-                submitted_at=o.get("submitted_at"),
-                updated_at=o.get("updated_at"),
-                broker_order_id=o.get("broker_order_id") or o.get("id"),
-                client_order_id=o.get("client_order_id"),
-                raw=o,
-            )
-        )
+    for o in items:
+        try:
+            payload = {
+                "account_id": o.get("account_id") or (account or ""),
+                "id": str(o.get("id") or o.get("order_id") or ""),
+                "symbol": o.get("symbol") or "",
+                "side": o.get("side") or "",
+                "type": o.get("type") or "",
+                "qty": float(o.get("qty") or o.get("quantity") or 0.0),
+                "filled_qty": float(o.get("filled_qty") or o.get("filled_quantity") or 0.0),
+                "limit_price": o.get("limit_price"),
+                "stop_price": o.get("stop_price"),
+                "time_in_force": o.get("time_in_force") or o.get("tif"),
+                "status": o.get("status") or "",
+                "submitted_at": o.get("submitted_at"),
+                "filled_at": o.get("filled_at"),
+                "raw": o,
+            }
+            docs.append(_build_doc(OrderDoc, payload))
+        except Exception:
+            continue
 
-    resp_doc = OrdersResponse(orders=docs)
-    acct = str(account or "")
-    st = str(status or "").lower()
-    if st in ("active", "closed"):
-        _CACHE_ORDERS[f"{acct}:{st}"] = resp_doc
-    return resp_doc
+    out = OrdersResponse(orders=docs)
+    global _LAST_ORDERS
+    _LAST_ORDERS = out
+    _mark_ok("orders")
+    return out
 
 
 @app.post("/v1/orders")
@@ -557,15 +553,62 @@ async def cancel_all(body: AccountActionIn) -> Dict[str, Any]:
 
 @app.get("/events")
 async def proxy_events(request: Request):
-    """Proxy Trader SSE stream to the browser (avoids CORS issues)."""
-    url = f"{TRADER_BASE}/v1/events"
+    """Proxy Trader SSE stream to the browser (avoids CORS issues).
+
+    HARD RULE: never crash BrokerView. If Trader is down, emit a lightweight
+    status event and keep the stream alive.
+    """
+    trader_base = TRADER_BASE.rstrip("/")
+    url = f"{trader_base}/events"
 
     async def _iter():
-        async with httpx.AsyncClient(timeout=None) as cli:
-            async with cli.stream("GET", url, headers={"Accept": "text/event-stream"}) as r:
-                async for chunk in r.aiter_raw():
-                    if await request.is_disconnected():
-                        break
-                    yield chunk
+        while True:
+            if await request.is_disconnected():
+                break
+            try:
+                async with httpx.AsyncClient(timeout=10) as cli:
+                    async with cli.stream("GET", url, headers={"Accept": "text/event-stream"}) as r:
+                        async for chunk in r.aiter_raw():
+                            if chunk:
+                                yield chunk
+                await asyncio.sleep(0.25)
+            except Exception:
+                yield b"event: status\ndata: trader_unreachable\n\n"
+                await asyncio.sleep(1.0)
 
     return StreamingResponse(_iter(), media_type="text/event-stream")
+
+
+
+@app.get("/v1/closed_positions")
+async def closed_positions(scope: str = "today", account: Optional[str] = None, limit: int = 1000) -> Dict[str, Any]:
+    """Closed positions list for UI.
+
+    HARD RULE: If Trader is unreachable OR endpoint is missing, return empty.
+    BrokerView never invents state.
+    """
+    params: Dict[str, Any] = {"scope": scope, "limit": int(limit)}
+    if account:
+        params["account_id"] = account
+
+    paths = [
+        "/v1/portfolio/closed_positions",
+        "/v1/portfolio/closed-positions",
+        "/v1/closed_positions",
+        "/v1/closed-positions",
+    ]
+
+    async with httpx.AsyncClient(timeout=5) as client:
+        for p in paths:
+            try:
+                resp = await client.get(f"{TRADER_BASE}{p}", params=params)
+                if resp.status_code == 404:
+                    continue
+                resp.raise_for_status()
+                data = resp.json() if resp.content else {}
+                items = data.get("items") or data.get("closed_positions") or []
+                return {"closed_positions": items}
+            except Exception:
+                continue
+
+    return {"closed_positions": []}

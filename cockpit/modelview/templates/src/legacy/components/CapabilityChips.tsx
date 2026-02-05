@@ -1,0 +1,3 @@
+import React from 'react'; import type { CapabilityDoc } from '@/types';
+function Badge({ children, muted }:{children:React.ReactNode; muted?:boolean}){return <span style={{fontSize:12,padding:'2px 6px',borderRadius:8,border:'1px solid #2e2e2e',background:muted?'transparent':'#1f1f1f',opacity:muted?0.6:1}}>{children}</span>}
+export default function CapabilityChips({caps}:{caps:CapabilityDoc|null}){const m=caps?.native;const chip=(l:string,on?:boolean)=>on===undefined?<Badge key={l} muted>{l}: …</Badge>:<Badge key={l} muted={!on}>{l}</Badge>;return <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>{chip('MKT',m?.market)}{chip('LMT',m?.limit)}{chip('STP',m?.stop)}{chip('STP-LMT',m?.stop_limit)}{chip('TRAIL',m?.trailing)}{chip('OCO',m?.oco)}</div>;}

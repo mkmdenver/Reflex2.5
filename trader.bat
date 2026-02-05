@@ -23,6 +23,7 @@ REM LIVE DEFAULTS (override in .env/.env.local if you want)
 REM ===========================================================================
 
 set "REFLEX_MODE=LIVE"
+set "REFLEX_INSTANCE_ID=dev"
 
 if "%REFLEX_MODE%"=="LIVE" (
   set "ORDER_CHANNEL=trader.orders.live"
@@ -188,11 +189,11 @@ REM ---------------------------------------------------------------------------
 REM TradeView (optional)
 REM ---------------------------------------------------------------------------
 
-REM if exist "%ROOT%\traderview.bat" (
+REM if exist "%ROOT%\tradeview.bat" (
 REM   echo [LAUNCH] TradeView
-REM   start "TradeView" /min cmd /k ""%ROOT%\traderview.bat""
+REM   start "TradeView" /min cmd /k ""%ROOT%\tradeview.bat""
 REM ) else (
-REM   echo [SKIP] traderview.bat not found
+REM   echo [SKIP] tradeview.bat not found
 REM )
 
 endlocal

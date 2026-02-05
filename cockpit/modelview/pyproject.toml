@@ -1,0 +1,13 @@
+[project]
+name = "modelview"
+version = "0.1.0"
+description = "ModelView cockpit service"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.110",
+  "uvicorn>=0.23",
+  "httpx>=0.25",
+]
+
+[project.scripts]
+modelview = "modelview.main:app"

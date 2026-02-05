@@ -37,7 +37,7 @@ REM ----------------------------
 REM PTI switches
 REM ----------------------------
 
-set "PTI_GEN_ID=1"
+set "PTI_GEN_ID=B"
 
 REM LIVE | REPLAY
 set "PTI_FEED_MODE=LIVE"   

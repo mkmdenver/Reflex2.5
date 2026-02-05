@@ -1,0 +1,8 @@
+export type SessionState='PREMARKET'|'REGULAR'|'POST'|'OVERNIGHT_CLOSED';
+export interface MarketSessionDoc{session:SessionState;session_open_at?:string;session_close_at?:string;regular_close_at?:string;}
+export interface AccountSummary{account_id:string;broker:string;name?:string;buying_power:number;cash:number;equity:number;pdt?:boolean;last_heartbeat_at?:string;}
+export interface CapabilityDoc{broker:string;account_id:string;session:SessionState;native:{market:boolean;limit:boolean;stop:boolean;stop_limit:boolean;trailing:boolean;oco:boolean;extended_hours_flag?:boolean};constraints?:{tif?:string[];min_qty?:number;route_select?:boolean};as_of:string;source:'probe'|'profile'|'override';}
+export interface PositionRow{symbol:string;qty:number;avg_price:number;market_price:number;unrealized_pl:number;}
+export interface OrderRow{id:string;account_id:string;symbol:string;side:'buy'|'sell';type:'market'|'limit'|'stop'|'stop_limit'|'trailing';status:'working'|'filled'|'canceled'|'rejected'|'pending';limit_price?:number;stop_price?:number;tif?:'day'|'gtc'|'ioc';extended_hours?:boolean;submitted_at?:string;hybrid?:boolean;note?:string;}
+export interface CreateOrderRequest{account_id:string;symbol:string;side:'buy'|'sell';type:'market'|'limit'|'stop'|'stop_limit'|'trailing';qty:number;limit_price?:number;stop_price?:number;tif?:'day'|'gtc'|'ioc';extended_hours?:boolean;bracket?:{take_profit?:number;stop_loss?:number;stop_limit_offset?:number};advanced?:{simulate_if_unsupported?:boolean;good_after?:string;cancel_if_not_filled_at?:string};client_order_id?:string;note?:string;}
+export interface CreateOrderResponse{order_id:string;emulation_plan?:Record<string,unknown>;}

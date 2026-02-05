@@ -15,6 +15,8 @@ if not exist "%PY%" (
   exit /b 1
 )
 
+set "REFLEX_INSTANCE_ID=dev"
+
 REM Clean, deterministic runtime
 set "PYTHONNOUSERSITE=1"
 set "PYTHONPATH=%ROOT%"
@@ -31,6 +33,7 @@ echo [ENV]  PY=%PY%
 echo [ENV]  PYTHONPATH=%PYTHONPATH%
 echo [ENV]  DATAHUB_API_PORT=%DATAHUB_API_PORT%
 echo [ENV]  REFLEX_PG_DSN=%REFLEX_PG_DSN%
+echo [ENV]  REFLEX_INSTANCE_ID=%REFLEX_INSTANCE_ID%
 
 echo.
 

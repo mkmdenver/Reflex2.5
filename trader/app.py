@@ -17,6 +17,7 @@ from collections import deque as _deque
 from uuid import uuid4
 from fastapi import FastAPI, Query, HTTPException, Request
 from fastapi.responses import JSONResponse
+from starlette.responses import StreamingResponse
 
 from .portfolio_manager import PortfolioManager
 from .alpaca_trade_updates import listen_trade_updates
@@ -144,6 +145,211 @@ def _is_active_status(st: Optional[str]) -> bool:
 
 _MANAGED_TRADES: Dict[str, Dict[str, Any]] = {}
 _INTENT_HISTORY: Deque[Dict[str, Any]] = _deque(maxlen=500)
+
+# ---------------------------------------------------------------------------
+# Broker-truth Trade Ledger (in-memory)
+#
+# Purpose: keep Trader's books consistent with broker reality, even when
+# trades are initiated/closed manually (BrokerView buttons, broker UI, etc.).
+#
+# Key rule: if the broker is flat for a symbol/account, Trader must treat any
+# corresponding open trade as CLOSED on our books.
+# ---------------------------------------------------------------------------
+
+# (account_id, symbol) -> open ledger trade
+_LEDGER_OPEN: Dict[str, Dict[str, Any]] = {}
+
+# Closed ledger trades (newest first)
+_LEDGER_CLOSED: Deque[Dict[str, Any]] = _deque(maxlen=int(os.getenv("TRADER_LEDGER_CLOSED_MAX", "5000") or 5000))
+
+# Last seen qty/avg per (account_id, symbol)
+_LEDGER_LAST_POS: Dict[str, Dict[str, float]] = {}
+
+
+def _ls_key(aid: str, symbol: str) -> str:
+    return f"{aid}::{symbol.upper()}"
+
+
+def _epoch_to_iso(x: Any) -> Optional[str]:
+    try:
+        v = float(x)
+        return datetime.fromtimestamp(v, tz=timezone.utc).isoformat()
+    except Exception:
+        return None
+
+
+def _pick_fill_price_and_ts(o: Dict[str, Any]) -> tuple[Optional[float], Optional[str]]:
+    """Best-effort extraction of fill price + ts from a local/broker order doc."""
+    try:
+        raw = o.get("raw") if isinstance(o.get("raw"), dict) else {}
+
+        # Price can live either in the embedded raw (broker adapter) or at the top
+        # level (trade_updates telemetry).
+        px = raw.get("avg_fill_price")
+        if px is None:
+            px = raw.get("first_fill_price")
+        if px is None:
+            px = o.get("avg_fill_price")
+        if px is None:
+            px = o.get("first_fill_price")
+        if px is None:
+            px = o.get("filled_avg_price")
+        px_f = float(px) if px is not None else None
+
+        # Timestamps can also live in both places.
+        ts = raw.get("filled_ts") or raw.get("first_fill_ts")
+        if ts is None:
+            ts = o.get("filled_ts") or o.get("first_fill_ts")
+        iso = _epoch_to_iso(ts) if ts is not None else None
+        if iso is None:
+            # fall back to ISO fields
+            iso = raw.get("updated_at") or o.get("updated_at") or o.get("submitted_at")
+        return px_f, (str(iso) if iso else None)
+    except Exception:
+        return None, None
+
+
+def _latest_filled_order(account_id: str, symbol: str, side: str) -> Optional[Dict[str, Any]]:
+    """Return the most recent filled order for account+symbol+side from local cache."""
+    try:
+        sym = (symbol or "").upper()
+        want_side = (side or "").lower().strip()
+        best = None
+        best_ts = 0.0
+        for o in list(_LOCAL_ORDERS.values()):
+            try:
+                if o.get("account_id") != account_id:
+                    continue
+                if (o.get("symbol") or "").upper() != sym:
+                    continue
+                if (o.get("status") or "").lower() != "filled":
+                    continue
+                if (o.get("side") or "").lower() != want_side:
+                    continue
+                raw = o.get("raw") if isinstance(o.get("raw"), dict) else {}
+                ts = raw.get("filled_ts") or raw.get("first_fill_ts")
+                if ts is None:
+                    # ISO fallback
+                    iso = raw.get("updated_at") or o.get("updated_at")
+                    if iso:
+                        try:
+                            ts = datetime.fromisoformat(str(iso).replace("Z", "+00:00")).timestamp()
+                        except Exception:
+                            ts = None
+                tsv = float(ts) if ts is not None else 0.0
+                if tsv >= best_ts:
+                    best_ts = tsv
+                    best = o
+            except Exception:
+                continue
+        return best
+    except Exception:
+        return None
+
+
+async def _ledger_sync_account(account_id: str) -> None:
+    """Sync the broker-truth ledger for one account from PortfolioManager snapshot."""
+    try:
+        snap = getattr(pm, "portfolio", {}).get(account_id)
+        if not snap:
+            return
+        # snapshot dict form
+        sdict = snap.to_dict() if hasattr(snap, "to_dict") else (snap if isinstance(snap, dict) else {})
+        positions = sdict.get("positions") or []
+
+        current: Dict[str, Dict[str, float]] = {}
+        for p in positions:
+            try:
+                sym = str(p.get("symbol") if isinstance(p, dict) else getattr(p, "symbol", "")).upper()
+                if not sym:
+                    continue
+                qty = float(p.get("qty") if isinstance(p, dict) else getattr(p, "qty", 0.0) or 0.0)
+                avg = float(p.get("avg_price") if isinstance(p, dict) else getattr(p, "avg_price", 0.0) or 0.0)
+                if abs(qty) < 1e-12:
+                    qty = 0.0
+                current[sym] = {"qty": qty, "avg": avg}
+            except Exception:
+                continue
+
+        prev = _LEDGER_LAST_POS.get(account_id, {})
+        all_syms = set(prev.keys()) | set(current.keys())
+
+        updated_iso = sdict.get("updated_at") or _iso_now()
+
+        for sym in all_syms:
+            prev_qty = float(prev.get(sym, {}).get("qty", 0.0) or 0.0)
+            prev_avg = float(prev.get(sym, {}).get("avg", 0.0) or 0.0)
+            cur_qty = float(current.get(sym, {}).get("qty", 0.0) or 0.0)
+            cur_avg = float(current.get(sym, {}).get("avg", 0.0) or 0.0)
+
+            k = _ls_key(account_id, sym)
+
+            # OPEN: 0 -> nonzero
+            if abs(prev_qty) < 1e-12 and abs(cur_qty) >= 1e-12:
+                if k not in _LEDGER_OPEN:
+                    side = "LONG" if cur_qty >= 0 else "SHORT"
+                    _LEDGER_OPEN[k] = {
+                        "trade_id": str(uuid4()),
+                        "account_id": account_id,
+                        "symbol": sym,
+                        "side": side,
+                        "qty": abs(cur_qty),
+                        "entry_price": cur_avg,
+                        "entry_ts": updated_iso,
+                        "open_source": "broker_reconcile",
+                    }
+                    log.info("ledger.open", extra={"account_id": account_id, "symbol": sym, "qty": cur_qty})
+
+            # CLOSE: nonzero -> 0
+            if abs(prev_qty) >= 1e-12 and abs(cur_qty) < 1e-12:
+                ot = _LEDGER_OPEN.pop(k, None)
+                if ot is None:
+                    # synthesize an open trade record (best-effort)
+                    side = "LONG" if prev_qty >= 0 else "SHORT"
+                    ot = {
+                        "trade_id": str(uuid4()),
+                        "account_id": account_id,
+                        "symbol": sym,
+                        "side": side,
+                        "qty": abs(prev_qty),
+                        "entry_price": prev_avg,
+                        "entry_ts": updated_iso,
+                        "open_source": "broker_reconcile_synth",
+                    }
+
+                # try to pick exit price/ts from local filled orders
+                exit_side = "sell" if str(ot.get("side") or "LONG").upper() == "LONG" else "buy"
+                last_fill = _latest_filled_order(account_id, sym, exit_side)
+                exit_px, exit_ts = _pick_fill_price_and_ts(last_fill or {})
+
+                doc = {
+                    "trade_id": ot.get("trade_id"),
+                    "account_id": account_id,
+                    "symbol": sym,
+                    "side": ot.get("side") or "LONG",
+                    "qty": ot.get("qty"),
+                    "entry_price": ot.get("entry_price"),
+                    "entry_ts": ot.get("entry_ts"),
+                    "exit_price": exit_px,
+                    "exit_ts": exit_ts or updated_iso,
+                    "pnl": None,
+                    "close_reason": "BROKER_FLAT",
+                    "close_source": "broker_reconcile",
+                }
+
+                try:
+                    if doc["entry_price"] is not None and doc["exit_price"] is not None and doc["qty"] is not None:
+                        doc["pnl"] = (float(doc["exit_price"]) - float(doc["entry_price"])) * float(doc["qty"]) \
+                            * (1.0 if str(doc.get("side") or "LONG").upper() == "LONG" else -1.0)
+                except Exception:
+                    pass
+
+                _LEDGER_CLOSED.appendleft(doc)
+                log.info("ledger.close", extra={"account_id": account_id, "symbol": sym, "pnl": doc.get("pnl")})
+
+        _LEDGER_LAST_POS[account_id] = current
+    except Exception:
+        log.exception("ledger.sync.failed", extra={"account_id": account_id})
 
 # ---------------------------------------------------------------------------
 # Intent -> Trade (missing machinery)
@@ -800,6 +1006,8 @@ async def _background_reconcile(loop: asyncio.AbstractEventLoop):
                 fn = getattr(pm, "reconcile_account", None)
                 if fn is not None:
                     await _call_maybe_async(fn, aid)
+                # Keep internal ledger in sync with broker truth.
+                await _ledger_sync_account(aid)
         except Exception:
             pass
         await asyncio.sleep(float(os.getenv("TRADER_RECONCILE_SECS", "5") or 5))
@@ -836,6 +1044,13 @@ async def _background_broker_events(loop: asyncio.AbstractEventLoop):
                                 asyncio.create_task,
                                 _call_maybe_async(rec_acc, account_id),
                             )
+
+                        # ledger sync (best-effort): once reconcile completes,
+                        # pull snapshot and detect open/close transitions.
+                        loop.call_soon_threadsafe(
+                            asyncio.create_task,
+                            _ledger_sync_account(account_id),
+                        )
 
                         # refresh orders cache so statuses advance (SUBMITTED->FILLED)
                         loop.call_soon_threadsafe(
@@ -1121,6 +1336,61 @@ async def events(limit: int = Query(200, ge=1, le=1000)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
+@app.get("/events")
+async def events_sse(request: Request):
+    """
+    Server-Sent Events stream for BrokerView (and any other UI).
+
+    BrokerView has historically polled /events; some builds only exposed /v1/events.
+    This endpoint keeps the UI happy and avoids console spam.
+
+    Contract:
+      - Never blocks the event loop
+      - Never throws (always yields heartbeats / status)
+    """
+    import json as _json
+
+    async def _gen():
+        hello = {"type": "status", "status": "connected", "ts": time.time(), "iso_utc": _iso_now()}
+        yield f"event: status\ndata: {_json.dumps(hello)}\n\n".encode("utf-8")
+
+        while True:
+            if await request.is_disconnected():
+                break
+            try:
+                payload = {
+                    "type": "heartbeat",
+                    "ts": time.time(),
+                    "iso_utc": _iso_now(),
+                    "accounts": len(getattr(pm, "adapters", {}) or {}),
+                }
+
+                # best-effort: include a small tail of recent events
+                try:
+                    items = []
+                    pm_events = getattr(pm, "_events", {}) or {}
+                    if isinstance(pm_events, dict):
+                        for aid, dq in pm_events.items():
+                            for ev in (dq or []):
+                                if isinstance(ev, dict):
+                                    items.append({"account_id": aid, **ev})
+                    for ev in list(_INTENT_HISTORY)[-25:]:
+                        if isinstance(ev, dict):
+                            items.append(ev)
+                    if items:
+                        payload["items"] = items[-50:]
+                except Exception:
+                    pass
+
+                yield f"event: events\ndata: {_json.dumps(payload)}\n\n".encode("utf-8")
+            except Exception:
+                err = {"type": "status", "status": "error", "ts": time.time(), "iso_utc": _iso_now()}
+                yield f"event: status\ndata: {_json.dumps(err)}\n\n".encode("utf-8")
+            await asyncio.sleep(1.0)
+
+    return StreamingResponse(_gen(), media_type="text/event-stream")
+
 @app.get("/v1/accounts")
 async def accounts():
     """
@@ -1266,6 +1536,44 @@ async def portfolio_closed_positions(
             today_et = datetime.now(tz=tz).date()
 
         items: List[Dict[str, Any]] = []
+
+        # 1) Broker-truth ledger closes (covers manual buy/sell and broker-side closes)
+        for t in list(_LEDGER_CLOSED):
+            try:
+                if not isinstance(t, dict):
+                    continue
+                if account_id and str(t.get("account_id") or "") != str(account_id):
+                    continue
+
+                exit_ts = t.get("exit_ts")
+                if today_et is not None and exit_ts:
+                    try:
+                        d = datetime.fromisoformat(str(exit_ts).replace("Z", "+00:00"))
+                        if tz is not None:
+                            d = d.astimezone(tz)
+                        if d.date() != today_et:
+                            continue
+                    except Exception:
+                        pass
+
+                items.append({
+                    "trade_id": t.get("trade_id"),
+                    "account_id": t.get("account_id"),
+                    "gen_id": t.get("gen_id"),
+                    "symbol": t.get("symbol"),
+                    "side": t.get("side") or "LONG",
+                    "qty": t.get("qty"),
+                    "entry_price": t.get("entry_price"),
+                    "exit_price": t.get("exit_price"),
+                    "exit_ts": exit_ts,
+                    "pnl": t.get("pnl"),
+                    "close_reason": t.get("close_reason") or "CLOSED",
+                    "close_source": t.get("close_source") or "ledger",
+                })
+            except Exception:
+                continue
+
+        # 2) Managed DONE trades (legacy path)
         for t in list(_MANAGED_TRADES.values()):
             if not isinstance(t, dict):
                 continue
